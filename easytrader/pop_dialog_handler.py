@@ -122,12 +122,16 @@ class PopDialogHandler:
             ).click()
 
     def _submit_by_shortcut(self):
-        if self._background:
-            # 后台模式不能按快捷键（type_keys 依赖前台焦点），改为给按钮发 BM_CLICK 消息
+        # 优先直接点击确认按钮（不依赖前台焦点与快捷键，后台/前台均稳定）
+        try:
             self._submit_by_click()
             return
+        except Exception as ex:
+            logger.debug("直接点击确认按钮失败，回退 Alt+Y 快捷键: %s", ex)
+        if self._background:
+            return
         self._set_foreground(self._app.top_window())
-        self._app.top_window().type_keys("%Y", set_foreground=False)
+        self._app.top_window().type_keys("%Y", set_foreground=True)
 
     def _close(self):
         self._app.top_window().close()

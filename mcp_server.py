@@ -54,6 +54,15 @@ if _REPO_ROOT not in sys.path:
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 import easytrader  # noqa: E402
 from easytrader import grid_strategies  # noqa: E402
+from easytrader import ths_api_bridge  # noqa: E402
+from easytrader.log import logger as _et_logger  # noqa: E402
+
+if LOG_FILE:
+    _et_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _et_file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    _et_logger.addHandler(_et_file_handler)
 from easytrader.utils import ths_no_check  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -112,6 +121,9 @@ def get_config() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 _gui_lock = threading.Lock()
 _trader_instance: Optional[Any] = None
+# 内嵌 API 桥（跑在 xiadan.exe 内嵌 Python 里）：可用时读写全部走它，彻底脱离 GUI
+_bridge_client: Optional[Any] = None
+_bridge_checked = False
 # 短缓存：key -> (timestamp, data)，用于防止高频轮询触发同花顺验证码（Issue #448/#452）
 _read_cache: Dict[str, Tuple[float, Any]] = {}
 
@@ -134,6 +146,43 @@ def _set_cached(key: str, val: Any) -> None:
 
 def _invalidate_read_cache() -> None:
     _read_cache.clear()
+
+
+def _get_bridge() -> Optional[Any]:
+    """惰性探测同花顺内嵌 API 桥；不可用则返回 None（回退 GUI 策略）。"""
+    global _bridge_client, _bridge_checked
+    if _bridge_checked:
+        return _bridge_client
+    _bridge_checked = True
+    client = ths_api_bridge.bridge_from_env()
+    if client is None:
+        return None
+    if client.available():
+        ping = {}
+        try:
+            ping = client.ping()
+        except Exception:
+            ping = {}
+        _bridge_client = client
+        logger.info(
+            "同花顺内嵌 API 桥已连接 127.0.0.1:%s（gui 模拟点击可完全停用）", client.port
+        )
+        logger.debug("bridge ping: %s", ping)
+    else:
+        logger.info("未检测到同花顺内嵌 API 桥，回退到 GUI(wmcopy) 模式")
+        _bridge_client = None
+    return _bridge_client
+
+
+def _reset_bridge() -> None:
+    global _bridge_client, _bridge_checked
+    try:
+        if _bridge_client is not None:
+            _bridge_client.close()
+    except Exception:
+        pass
+    _bridge_client = None
+    _bridge_checked = False
 
 
 def _apply_grid_strategy(trader: Any, strategy_name: str) -> None:
@@ -259,10 +308,15 @@ def get_balance() -> str:
         if hit:
             return _json_ok(cached_val, cached=True)
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                data = ths_api_bridge.money_to_balance(bridge.balance())
+                _set_cached("balance", data)
+                return _json_ok(data, cached=False, source="api_bridge")
             trader = _get_trader()
             data = trader.balance
             _set_cached("balance", data)
-            return _json_ok(data, cached=False)
+            return _json_ok(data, cached=False, source="gui")
         except Exception as ex:
             logger.exception("get_balance 失败")
             return _json_err(str(ex))
@@ -281,11 +335,21 @@ def get_position() -> str:
                 cached=True,
             )
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                data = ths_api_bridge.position_to_records(bridge.position())
+                _set_cached("position", data)
+                return _json_ok(
+                    data, count=len(data), cached=False, source="api_bridge"
+                )
             trader = _get_trader()
             data = trader.position
             _set_cached("position", data)
             return _json_ok(
-                data, count=len(data) if isinstance(data, list) else 0, cached=False
+                data,
+                count=len(data) if isinstance(data, list) else 0,
+                cached=False,
+                source="gui",
             )
         except Exception as ex:
             logger.exception("get_position 失败")
@@ -297,9 +361,17 @@ def get_today_entrusts() -> str:
     """只读查询：获取当日全部委托记录列表。"""
     with _gui_lock:
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                payload = bridge.entrusts()
+                orders = payload.get("fullorder") or payload.get("order") or {}
+                data = ths_api_bridge.orders_to_records(orders)
+                return _json_ok(data, count=len(data), source="api_bridge")
             trader = _get_trader()
             data = trader.today_entrusts
-            return _json_ok(data, count=len(data) if isinstance(data, list) else 0)
+            return _json_ok(
+                data, count=len(data) if isinstance(data, list) else 0, source="gui"
+            )
         except Exception as ex:
             logger.exception("get_today_entrusts 失败")
             return _json_err(str(ex))
@@ -310,9 +382,12 @@ def get_today_trades() -> str:
     """只读查询：获取当日全部成交记录列表。"""
     with _gui_lock:
         try:
+            # 成交明细暂无稳定的 ths_api 字段，仍走 GUI 表格
             trader = _get_trader()
             data = trader.today_trades
-            return _json_ok(data, count=len(data) if isinstance(data, list) else 0)
+            return _json_ok(
+                data, count=len(data) if isinstance(data, list) else 0, source="gui"
+            )
         except Exception as ex:
             logger.exception("get_today_trades 失败")
             return _json_err(str(ex))
@@ -321,13 +396,23 @@ def get_today_trades() -> str:
 @mcp.tool()
 def get_client_info() -> str:
     """
-    只读：报告客户端连接状态、表格读取策略与「复制/保存验证码风控」绕过状态。
+    只读：报告客户端状态、数据/下单通道（内嵌 API 桥 or GUI）与风控状态。
 
-    用于 AI 自检：确认当前会话能否安全地高频读取持仓/委托/成交，
-    captcha_bypass.no_check_sorc == "1" 表示风控验证码已被关闭。
+    自检要点：
+    - ``api_bridge.available == true`` → 读写全部走客户端内嵌 API，完全不碰 GUI；
+    - ``captcha_bypass.no_check_sorc == "1"`` → 复制/保存的验证码弹窗已关闭；
+    - ``cbas_telemetry.muted == true`` → 复制/导出埋点已在客户端内截断。
     """
     cfg = get_config()
     with _gui_lock:
+        bridge = _get_bridge()
+        bridge_info = {
+            "available": bridge is not None,
+            "port": getattr(bridge, "port", None),
+            "note": "available=true 时 balance/position/entrusts/buy/sell/cancel 均走客户端内嵌 API",
+        }
+        # GUI 信息尽量给，但不因 GUI 不可用而整体失败
+        gui_info: Dict[str, Any] = {}
         try:
             trader = _get_trader()
             state = getattr(trader, "captcha_bypass_state", None)
@@ -337,35 +422,39 @@ def get_client_info() -> str:
                 ini_path = state.get("path")
                 ini_flag = ths_no_check.read_no_check_sor(ini_path)
             cbas = getattr(trader, "cbas_mute_state", None)
-            return _json_ok(
-                {
-                    "broker": cfg["broker"],
-                    "grid_strategy": cfg["grid_strategy"],
-                    "background_mode": cfg["background_mode"],
-                    "dry_run": cfg["dry_run"],
-                    "max_order_amount": cfg["max_order_amount"],
-                    "exe_path": getattr(trader, "_exe_path", None),
-                    "main_window_title": trader.main.window_text(),
-                    "captcha_bypass": {
-                        "enabled": ini_flag == "1",
-                        "ini_path": ini_path,
-                        "no_check_sorc": ini_flag,
-                        "backup": (state or {}).get("backup"),
-                    },
-                    "cbas_telemetry": {
-                        "muted": bool(cbas and (cbas.get("sites") or {}))
-                        and all(
-                            site.get("applied")
-                            for site in (cbas.get("sites") or {}).values()
-                        ),
-                        "sites": (cbas or {}).get("sites"),
-                        "note": "muted=true 表示复制/导出的 0xFF1/0xFF5 埋点已在本进程内截断",
-                    },
-                }
-            )
+            gui_info = {
+                "exe_path": getattr(trader, "_exe_path", None),
+                "main_window_title": trader.main.window_text(),
+                "captcha_bypass": {
+                    "enabled": ini_flag == "1",
+                    "ini_path": ini_path,
+                    "no_check_sorc": ini_flag,
+                    "backup": (state or {}).get("backup"),
+                },
+                "cbas_telemetry": {
+                    "muted": bool(cbas and (cbas.get("sites") or {}))
+                    and all(
+                        site.get("applied")
+                        for site in (cbas.get("sites") or {}).values()
+                    ),
+                    "sites": (cbas or {}).get("sites"),
+                    "note": "muted=true 表示复制/导出的 0xFF1/0xFF5 埋点已在本进程内截断",
+                },
+            }
         except Exception as ex:
-            logger.exception("get_client_info 失败")
-            return _json_err(str(ex))
+            gui_info = {"error": str(ex)}
+
+        payload = {
+            "broker": cfg["broker"],
+            "grid_strategy": cfg["grid_strategy"],
+            "background_mode": cfg["background_mode"],
+            "dry_run": cfg["dry_run"],
+            "max_order_amount": cfg["max_order_amount"],
+            "data_channel": "api_bridge" if bridge is not None else "gui",
+            "api_bridge": bridge_info,
+        }
+        payload.update(gui_info)
+        return _json_ok(payload)
 
 
 @mcp.tool()
@@ -387,6 +476,18 @@ def buy(stock_code: str, price: float, amount: int) -> str:
     order_value = round(float(price) * int(amount), 2)
     with _gui_lock:
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                result = bridge.buy(
+                    stock_code, price, amount, dry_run=cfg["dry_run"]
+                )
+                result = dict(result or {})
+                result.setdefault("estimated_amount_rmb", order_value)
+                result.setdefault("max_order_amount_rmb", cfg["max_order_amount"])
+                result["source"] = "api_bridge"
+                if not cfg["dry_run"]:
+                    _invalidate_read_cache()
+                return _json_ok(result, dry_run=cfg["dry_run"])
             trader = _get_trader()
             if cfg["dry_run"]:
                 result = trader.buy(stock_code, price, amount, dry_run=True)
@@ -421,6 +522,18 @@ def sell(stock_code: str, price: float, amount: int) -> str:
     order_value = round(float(price) * int(amount), 2)
     with _gui_lock:
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                result = bridge.sell(
+                    stock_code, price, amount, dry_run=cfg["dry_run"]
+                )
+                result = dict(result or {})
+                result.setdefault("estimated_amount_rmb", order_value)
+                result.setdefault("max_order_amount_rmb", cfg["max_order_amount"])
+                result["source"] = "api_bridge"
+                if not cfg["dry_run"]:
+                    _invalidate_read_cache()
+                return _json_ok(result, dry_run=cfg["dry_run"])
             trader = _get_trader()
             if cfg["dry_run"]:
                 result = trader.sell(stock_code, price, amount, dry_run=True)
@@ -462,6 +575,13 @@ def cancel_entrust(entrust_no: str) -> str:
 
     with _gui_lock:
         try:
+            bridge = _get_bridge()
+            if bridge is not None:
+                result = bridge.cancel(target_no, dry_run=False)
+                result = dict(result or {})
+                result["source"] = "api_bridge"
+                _invalidate_read_cache()
+                return _json_ok(result, dry_run=False)
             trader = _get_trader()
             result = trader.cancel_entrust(target_no)
             _invalidate_read_cache()

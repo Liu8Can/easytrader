@@ -777,7 +777,7 @@ class ClientTrader(IClientTrader):
 
         raise exceptions.TradeError(
             f"下单校验失败：点击下单后未收到委托确认弹窗，且在当日委托中也未查到匹配记录 "
-            f"(code={code}, price={price_str}, amount={amount_int})。请人工核对客户端状态！"
+            f"(code={code}, price={price_str}, amount={amount_int}, dialog_result={result!r})。请人工核对客户端状态！"
         )
 
     def _click(self, control_id):
@@ -803,11 +803,27 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def _get_pop_dialog_title(self):
-        return (
-            self._app.top_window()
-            .child_window(control_id=self._config.POP_DIALOD_TITLE_CONTROL_ID)
-            .window_text()
-        )
+        top = self._app.top_window()
+        try:
+            ctrl = top.child_window(control_id=self._config.POP_DIALOD_TITLE_CONTROL_ID)
+            if ctrl.exists(timeout=0.2):
+                txt = ctrl.window_text().strip()
+                if txt:
+                    logger.info("检测到弹窗标题(cid=%s): %r", self._config.POP_DIALOD_TITLE_CONTROL_ID, txt)
+                    return txt
+        except Exception:
+            pass
+        # 回退：部分同花顺 5.0 弹窗没有 cid=1365，直接读取弹窗自身标题（如“委托确认”、“提示信息”、“提示”）
+        win_title = (top.window_text() or "").strip()
+        try:
+            statics = [c.window_text().strip() for c in top.descendants(class_name="Static") if c.window_text().strip()]
+            btns = [c.window_text().strip() for c in top.descendants(class_name="Button") if c.window_text().strip()]
+            logger.info("检测到弹窗(无cid=1365): title=%r, statics=%r, buttons=%r", win_title, statics[:6], btns[:6])
+        except Exception:
+            logger.info("检测到弹窗(无cid=1365): title=%r", win_title)
+        if win_title:
+            return win_title
+        raise pywinauto.findwindows.ElementNotFoundError("popup has no title")
 
     @staticmethod
     def _read_edit_text(editor) -> str:
@@ -852,32 +868,33 @@ class ClientTrader(IClientTrader):
                     return False
             return False
 
-        # 第 1 次尝试：标准方式写入
-        self.type_edit_control_keys(editor, expected_str)
-        self.wait(0.08)
+        # 第 1 次尝试：同花顺 5.0 交易输入框普遍忽略 WM_SETTEXT(set_edit_text)，
+        # 直接向控件句柄发送 EM_SETSEL + WM_CLEAR + WM_CHAR 逐字符消息（同步处理、不抢焦点、免疫中文输入法、不污染剪贴板）
+        self._send_chars_to_edit(editor, expected_str)
+        self.wait(0.1)
         actual = self._read_edit_text(editor)
         if _matches(actual):
             return
         if actual == "":
-            # 同花顺 5.0 部分版本的交易 Edit 控件开启了防读取保护，WM_GETTEXT 恒返回空串；
-            # 此时 set_edit_text 已写入成功，严禁再触发 WM_CHAR/type_keys 覆盖导致首位吞字（如 512000 -> 12000）。
+            # 同花顺 5.0 交易 Edit 控件开启了防读取保护，WM_GETTEXT 恒返回空串；
+            # 此时 WM_CHAR 已同步写入完成，不再触发会吞字的前台 type_keys 覆盖重试。
             logger.info(
-                "%s 输入框 (cid=%s) 不支持跨进程文本回读（返回空串），保持标准写入结果 %r",
+                "%s 输入框 (cid=%s) 不支持跨进程文本回读（返回空串），已通过 WM_CHAR 写入 %r",
                 field_name,
                 control_id,
                 expected_str,
             )
             return
 
-        # 第 2 次尝试：直接向控件句柄发送 WM_CHAR（兼容同花顺自定义证券代码框，免疫中文输入法与后台焦点限制）
+        # 第 2 次尝试：标准方式写入（针对支持回读但 WM_CHAR 未命中的客户端）
         logger.warning(
-            "%s 输入框回读不一致 (actual=%r, expected=%r)，切换 WM_CHAR 逐字写入重试...",
+            "%s WM_CHAR 回读不一致 (actual=%r, expected=%r)，切换标准写入重试...",
             field_name,
             actual,
             expected_str,
         )
-        self._send_chars_to_edit(editor, expected_str)
-        self.wait(0.1)
+        self.type_edit_control_keys(editor, expected_str)
+        self.wait(0.08)
         actual = self._read_edit_text(editor)
         if _matches(actual):
             return
@@ -950,7 +967,7 @@ class ClientTrader(IClientTrader):
             for ch in str(text):
                 win32gui.SendMessage(hwnd, win32con.WM_CHAR, ord(ch), 0)
         except Exception as ex:
-            logger.debug("WM_CHAR 写入失败: %s", ex)
+            logger.warning("WM_CHAR 写入失败: %s", ex)
 
     def _paste_into_edit(self, editor, text: str):
         """通过剪贴板全选粘贴写入输入框，避免中文输入法拦截小数点或数字。
@@ -964,9 +981,21 @@ class ClientTrader(IClientTrader):
         try:
             import pyperclip
 
-            pyperclip.copy(str(text))
-            editor.set_focus()
-            editor.type_keys("^a^v", set_foreground=True)
+            saved_clip = None
+            try:
+                saved_clip = pyperclip.paste()
+            except Exception:
+                pass
+            try:
+                pyperclip.copy(str(text))
+                editor.set_focus()
+                editor.type_keys("^a^v", set_foreground=True)
+            finally:
+                if saved_clip is not None:
+                    try:
+                        pyperclip.copy(saved_clip)
+                    except Exception:
+                        pass
         except Exception as ex:
             logger.debug("剪贴板粘贴回退到 set_edit_text: %s", ex)
             editor.set_edit_text(str(text))

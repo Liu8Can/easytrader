@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import abc
+from contextlib import contextmanager
 import io
 import os
 import tempfile
@@ -123,19 +124,44 @@ class BaseStrategy(IGridStrategy):
         return df.to_dict("records")
 
 
+@contextmanager
+def _preserve_clipboard():
+    """在读取同花顺表格前后自动备份并还原用户剪贴板，彻底避免污染电脑剪贴板。"""
+    saved_text = None
+    has_saved = False
+    try:
+        import pyperclip
+
+        saved_text = pyperclip.paste()
+        has_saved = True
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        if has_saved and saved_text is not None:
+            try:
+                import pyperclip
+
+                pyperclip.copy(saved_text)
+            except Exception as ex:
+                logger.debug("还原用户剪贴板失败（忽略）: %s", ex)
+
+
 class Copy(BaseStrategy):
     """
-    通过复制 grid 内容到剪切板再读取来获取 grid 内容
+    通过复制 grid 内容到剪切板再读取来获取 grid 内容（自动备份/还原剪贴板，不污染用户剪贴板）
     """
 
     _need_captcha_reg = True
 
     def get(self, control_id: int) -> List[Dict]:
-        grid = self._get_grid(control_id)
-        self._set_foreground(grid)
-        grid.type_keys("^A^C", set_foreground=False, pause=0.2)
-        content = self._get_clipboard_data()
-        return self._format_grid_data(content)
+        with _preserve_clipboard():
+            grid = self._get_grid(control_id)
+            self._set_foreground(grid)
+            grid.type_keys("^A^C", set_foreground=False, pause=0.2)
+            content = self._get_clipboard_data()
+            return self._format_grid_data(content)
 
     def _format_grid_data(self, data: str) -> List[Dict]:
         if not data or not data.strip():
@@ -178,24 +204,25 @@ class WMCopy(Copy):
     """
 
     def get(self, control_id: int) -> List[Dict]:
-        grid = self._get_grid(control_id)
-        # 清空旧剪贴板内容，避免误读上一次复制的数据
-        try:
-            import pyperclip
+        with _preserve_clipboard():
+            grid = self._get_grid(control_id)
+            # 清空旧剪贴板内容，避免误读上一次复制的数据
+            try:
+                import pyperclip
 
-            pyperclip.copy("")
-        except Exception:
-            pass
-        grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
-        # 客户端写剪贴板可能占用 1~2 秒（16 列宽表），等久一点再读，避免 OpenClipboard 拒绝访问
-        self._trader.wait(0.35)
-        content = self._get_clipboard_data()
-        if not content or not content.strip():
-            # 若后台 WM_COMMAND 未命中（少数券商皮肤），再短暂重试一次
+                pyperclip.copy("")
+            except Exception:
+                pass
             grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
-            self._trader.wait(0.45)
+            # 客户端写剪贴板可能占用 1~2 秒（16 列宽表），等久一点再读，避免 OpenClipboard 拒绝访问
+            self._trader.wait(0.35)
             content = self._get_clipboard_data()
-        return self._format_grid_data(content)
+            if not content or not content.strip():
+                # 若后台 WM_COMMAND 未命中（少数券商皮肤），再短暂重试一次
+                grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
+                self._trader.wait(0.45)
+                content = self._get_clipboard_data()
+            return self._format_grid_data(content)
 
 
 class Xls(BaseStrategy):
