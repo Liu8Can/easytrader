@@ -22,13 +22,32 @@
 
 ### 3. 标准 Stdio MCP Server（`mcp_server.py`）
 - 基于 `mcp.server.fastmcp.FastMCP` 实现，所有日志与 `pywinauto` 警告强制输出至 `stderr`，保证 `stdout` 仅输出纯净 MCP JSON-RPC 协议。
-- 暴露 7 个工具（均返回结构化 JSON）：
-  - **只读**：`get_balance`、`get_position`、`get_today_entrusts`、`get_today_trades`
+- 暴露 8 个工具（均返回结构化 JSON）：
+  - **只读**：`get_client_info`（连接状态 + 验证码风控自检）、`get_balance`、`get_position`、`get_today_entrusts`、`get_today_trades`
   - **交易**：`buy(stock_code, price, amount)`、`sell(stock_code, price, amount)`、`cancel_entrust(entrust_no)`
 - 内置安全护栏与防抖：
   - `DRY_RUN`（默认 `true`）：仅校验参数与当前可见面板控件，绝不点击确认下单。
   - `MAX_ORDER_AMOUNT`（默认 `10000`）：单笔委托金额超限直接拦截。
   - `EASYTRADER_CACHE_TTL`（默认 `4.0` 秒）：`get_balance` / `get_position` 防抖短缓存，真实交易后自动失效。
+
+### 4. 同花顺「复制/保存数据」验证码风控：彻底绕过（精确取值，非 OCR）
+
+新版同花顺对表格的**复制**（`Ctrl+C` / `WM_COMMAND 0xE122`）与**另存为**（`Ctrl+S`）都会弹
+「检测到您正在拷贝/保存数据，为保护您的账号数据安全，请先输入验证码」，对自动化是硬阻断。
+
+本仓库通过逆向 `xiadan.exe` 定位到该风控的统一闸门（VA `0x246b530`），确认它每次操作都会读取
+客户端自身配置 `xiadan.ini` 的 `[AI_TRADE] no_check_sorc`：
+
+- **方案**：连接时幂等写入 `no_check_sorc=1`，闸门即直接放行 —— 不弹窗、不抢焦点、无需重启客户端；
+- **精确**：表格仍由客户端自己导出为 GBK/TSV（16 列全字段），**不是截图 OCR，没有误读风险**；
+- **可回滚**：首次修改自动备份 `xiadan.ini.bak.YYYYMMDD`，`ths_no_check.restore()` 一键恢复；
+- **可关闭**：`EASYTRADER_THS_NO_CHECK=false` 时不触碰客户端配置。
+
+实现位于 `easytrader/utils/ths_no_check.py`（`ClientTrader.enable_captcha_bypass()`），
+完整逆向过程、指令级证据与压测记录见 **[docs/ths_captcha_bypass.md](docs/ths_captcha_bypass.md)**。
+
+> 实测：`no_check_sorc=0` 复制必弹验证码；`=1` 后 10 次 0.3s 间隔的后台复制 10/10 成功、零弹窗。
+
 
 ---
 
@@ -60,7 +79,9 @@ python verify_live.py
         "MAX_ORDER_AMOUNT": "10000",
         "EASYTRADER_EXE_PATH": "D:\\同花顺软件\\同花顺\\xiadan.exe",
         "EASYTRADER_BROKER": "ths",
-        "EASYTRADER_GRID_STRATEGY": "xls",
+        "EASYTRADER_GRID_STRATEGY": "wmcopy",
+        "EASYTRADER_THS_NO_CHECK": "true",
+        "EASYTRADER_BACKGROUND_MODE": "true",
         "EASYTRADER_CACHE_TTL": "4.0",
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8"
@@ -78,7 +99,8 @@ python verify_live.py
 | `MAX_ORDER_AMOUNT` | `10000` | 单笔委托金额上限（元），超限直接拦截 |
 | `EASYTRADER_EXE_PATH` | 自动探测 | `xiadan.exe` 路径；留空时自动匹配“网上股票交易系统5.0”窗口 |
 | `EASYTRADER_BROKER` | `ths` | 客户端类型，支持 `ths` / `universal_client` / `miniqmt` 等 |
-| `EASYTRADER_GRID_STRATEGY` | `xls` | 表格读取策略，可选 `xls` / `copy` / `wmcopy` |
+| `EASYTRADER_GRID_STRATEGY` | `wmcopy` | 表格读取策略，可选 `wmcopy`（后台消息复制，推荐）/ `copy` / `xls` |
+| `EASYTRADER_THS_NO_CHECK` | `true` | 连接时写入 `xiadan.ini` 的 `[AI_TRADE] no_check_sorc=1`，关闭复制/保存验证码风控 |
 | `EASYTRADER_CACHE_TTL` | `4.0` | `get_balance` / `get_position` 防抖缓存时间（秒） |
 | `EASYTRADER_BACKGROUND_MODE` | `false` | 是否避免调用 `SetForegroundWindow` 抢前台焦点 |
 
