@@ -90,10 +90,58 @@ class ClientTrader(IClientTrader):
         self._main = None
         self._toolbar = None
         self._background_mode = False
+        self._exe_path = None
+        self._no_check_sorc = None
 
     def enable_background_mode(self, enabled: bool = True):
         """开启无感后台模式：通过 Win32 消息交互，避免每次操作把同花顺强行弹到最前端抢焦点。"""
         self._background_mode = bool(enabled)
+
+    def enable_captcha_bypass(self, value: str = "1"):
+        """关闭同花顺「复制/保存表格数据」风控验证码，让 grid 复制/导出恢复可用。
+
+        实现方式是写客户端自己的配置 ``<安装目录>\\xiadan.ini`` 的
+        ``[AI_TRADE] no_check_sorc=1``：xiadan.exe 的复制/保存闸门函数
+        (VA 0x246b530) 每次操作都会重新读取该键，读到首字符 ``'1'`` 即直接放行。
+
+        优点：不改二进制、不注入、不受 VMProtect 校验影响、无需重启客户端，
+        且表格数据仍由客户端自己导出，取值精确。详见
+        ``easytrader/utils/ths_no_check.py`` 与 ``docs/ths_captcha_bypass.md``。
+
+        :param value: ``"1"`` 关闭安全检查（默认）；``"0"`` 恢复检查。
+        :return: 写入结果 dict（path / changed / previous / value / backup）
+        """
+        from easytrader.utils import ths_no_check
+
+        exe_path = self._exe_path or self._config.DEFAULT_EXE_PATH or None
+        try:
+            result = ths_no_check.ensure_no_check_sor(
+                ths_no_check.find_xiadan_ini(exe_path=exe_path), value=value
+            )
+        except ths_no_check.NoCheckSorError as ex:
+            logger.warning("关闭同花顺导出安全检查失败: %s", ex)
+            raise exceptions.TradeError(str(ex)) from ex
+
+        self._no_check_sorc = result
+        if result["changed"]:
+            logger.info(
+                "已写入同花顺导出安全检查开关: %s (%s -> %s, 无需重启客户端)",
+                result["path"],
+                result["previous"],
+                result["value"],
+            )
+        else:
+            logger.info(
+                "同花顺导出安全检查已处于 no_check_sorc=%s，跳过: %s",
+                result["value"],
+                result["path"],
+            )
+        return result
+
+    @property
+    def captcha_bypass_state(self):
+        """最近一次 ``enable_captcha_bypass`` 的结果（未调用则为 None）。"""
+        return self._no_check_sorc
 
     @property
     def app(self):
@@ -156,6 +204,7 @@ class ClientTrader(IClientTrader):
         self._close_prompt_windows()
         self._main = self._resolve_main_window()
         self._init_toolbar()
+        self._exe_path = connect_path or None
 
     def _resolve_main_window(self):
         """优先定位“网上股票交易系统”主窗口，避免 top_window() 误拿到气泡/弹窗。"""
