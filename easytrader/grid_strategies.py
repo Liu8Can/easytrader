@@ -55,11 +55,20 @@ class BaseStrategy(IGridStrategy):
 
     def _get_grid(self, control_id: int):
         grid = self._trader.main.child_window(
-            control_id=control_id, class_name="CVirtualGridCtrl"
+            control_id=control_id, class_name="CVirtualGridCtrl", visible_only=True
         )
         return grid
 
     def _set_foreground(self, grid=None):
+        if getattr(self._trader, "_background_mode", False):
+            # 后台静默模式：绝不抢占前台焦点，仅在最小化时静默还原
+            try:
+                target = grid or self._trader.main
+                if target.has_style(win32defines.WS_MINIMIZE):
+                    ShowWindow(target.wrapper_object(), 4)  # SW_SHOWNOACTIVATE
+            except Exception as ex:
+                logger.debug("background restore ignored: %s", ex)
+            return
         try:
             if grid is None:
                 grid = self._trader.main
@@ -216,14 +225,26 @@ class Copy(BaseStrategy):
 
 class WMCopy(Copy):
     """
-    通过发送 WM_COMMAND(0xE122) 复制 grid 内容到剪切板再读取
+    通过发送 WM_COMMAND(0xE122) 在后台复制 grid 内容到剪切板再读取（不抢前台焦点）
     """
 
     def get(self, control_id: int) -> List[Dict]:
         grid = self._get_grid(control_id)
+        # 清空旧剪贴板内容，避免误读上一次复制的数据
+        try:
+            import pyperclip
+
+            pyperclip.copy("")
+        except Exception:
+            pass
         grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
-        self._trader.wait(0.2)
+        self._trader.wait(0.25)
         content = self._get_clipboard_data()
+        if not content or not content.strip():
+            # 若后台 WM_COMMAND 未命中（少数券商皮肤），再短暂重试一次
+            grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
+            self._trader.wait(0.35)
+            content = self._get_clipboard_data()
         return self._format_grid_data(content)
 
 

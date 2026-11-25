@@ -89,6 +89,11 @@ class ClientTrader(IClientTrader):
         self._app = None
         self._main = None
         self._toolbar = None
+        self._background_mode = False
+
+    def enable_background_mode(self, enabled: bool = True):
+        """开启无感后台模式：通过 Win32 消息交互，避免每次操作把同花顺强行弹到最前端抢焦点。"""
+        self._background_mode = bool(enabled)
 
     @property
     def app(self):
@@ -200,14 +205,17 @@ class ClientTrader(IClientTrader):
             self._toolbar = None
 
     def _ensure_main_window_ready(self):
-        """确保主窗口未处于最小化状态并置于前台（修复 Issue #506 / #457）。"""
+        """确保主窗口未处于最小化状态；后台模式下不抢前台焦点（修复 Issue #506 / #457）。"""
         if self._main is None:
             return
         try:
             if self._main.has_style(win32defines.WS_MINIMIZE):
-                ShowWindow(self._main.wrapper_object(), 9)  # SW_RESTORE
+                # 后台模式使用 SW_SHOWNOACTIVATE(4) 静默还原不抢焦点；前台模式使用 SW_RESTORE(9)
+                cmd = 4 if self._background_mode else 9
+                ShowWindow(self._main.wrapper_object(), cmd)
                 self.wait(0.2)
-            SetForegroundWindow(self._main.wrapper_object())
+            if not self._background_mode:
+                SetForegroundWindow(self._main.wrapper_object())
         except Exception as ex:
             logger.debug("restore/foreground main window ignored: %s", ex)
 
@@ -219,7 +227,7 @@ class ClientTrader(IClientTrader):
             for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
                 try:
                     ctrl = self._main.child_window(
-                        control_id=control_id, class_name="Static"
+                        control_id=control_id, class_name="Static", visible_only=True
                     )
                     raw_text = ctrl.window_text().replace(",", "").strip()
                     if raw_text in ("", "--", "-"):
@@ -577,15 +585,36 @@ class ClientTrader(IClientTrader):
         if dry_run:
             self._ensure_main_window_ready()
             self._dismiss_non_trade_popups()
+            # 必须加 visible_only=True：同花顺切换标签页后旧面板仍隐藏驻留内存，含多个相同 control_id
             submit_exists = self._main.child_window(
-                control_id=self._config.TRADE_SUBMIT_CONTROL_ID, class_name="Button"
+                control_id=self._config.TRADE_SUBMIT_CONTROL_ID,
+                class_name="Button",
+                visible_only=True,
+            ).exists(timeout=1)
+            code_exists = self._main.child_window(
+                control_id=self._config.TRADE_SECURITY_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
+            ).exists(timeout=1)
+            price_exists = self._main.child_window(
+                control_id=self._config.TRADE_PRICE_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
+            ).exists(timeout=1)
+            amount_exists = self._main.child_window(
+                control_id=self._config.TRADE_AMOUNT_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
             ).exists(timeout=1)
             logger.info(
-                "[DRY_RUN] 跳过实际下单点击: code=%s price=%s amount=%s submit_btn_ready=%s",
+                "[DRY_RUN] 跳过实际下单点击: code=%s price=%s amount=%s controls_ready=(submit=%s,code=%s,price=%s,amount=%s)",
                 code,
                 price_str,
                 amount_int,
                 submit_exists,
+                code_exists,
+                price_exists,
+                amount_exists,
             )
             return {
                 "dry_run": True,
@@ -594,7 +623,12 @@ class ClientTrader(IClientTrader):
                 "price_text": price_str,
                 "amount": amount_int,
                 "submit_button_ready": submit_exists,
-                "message": "DRY_RUN 模式已开启：仅完成参数与界面控件校验，未点击确认下单",
+                "edit_controls_ready": {
+                    "code": code_exists,
+                    "price": price_exists,
+                    "amount": amount_exists,
+                },
+                "message": "DRY_RUN 模式已开启：仅完成参数与当前可见面板控件校验，未点击确认下单",
             }
 
         self._set_trade_params(code, price_str, amount_int)
@@ -625,7 +659,9 @@ class ClientTrader(IClientTrader):
     def _submit_trade(self):
         time.sleep(0.2)
         self._main.child_window(
-            control_id=self._config.TRADE_SUBMIT_CONTROL_ID, class_name="Button"
+            control_id=self._config.TRADE_SUBMIT_CONTROL_ID,
+            class_name="Button",
+            visible_only=True,
         ).click()
 
     @perf_clock
@@ -646,7 +682,9 @@ class ClientTrader(IClientTrader):
         self, control_id: int, expected_text: str, field_name: str, is_float: bool = False
     ):
         """写入输入框并回读校验文本完全一致；若受输入法或行情回填干扰则自动采用剪贴板粘贴重试（修复 Issue #457 / #522）。"""
-        editor = self._main.child_window(control_id=control_id, class_name="Edit")
+        editor = self._main.child_window(
+            control_id=control_id, class_name="Edit", visible_only=True
+        )
         expected_str = str(expected_text).strip()
 
         def _matches(actual: str) -> bool:
@@ -725,21 +763,27 @@ class ClientTrader(IClientTrader):
         # 4. 点击下单前最终全量回读三项输入框，防止行情延迟回填篡改价格（修复 Issue #457 / #522）
         final_code = (
             self._main.child_window(
-                control_id=self._config.TRADE_SECURITY_CONTROL_ID, class_name="Edit"
+                control_id=self._config.TRADE_SECURITY_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
             )
             .window_text()
             .strip()
         )
         final_price = (
             self._main.child_window(
-                control_id=self._config.TRADE_PRICE_CONTROL_ID, class_name="Edit"
+                control_id=self._config.TRADE_PRICE_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
             )
             .window_text()
             .strip()
         )
         final_amount = (
             self._main.child_window(
-                control_id=self._config.TRADE_AMOUNT_CONTROL_ID, class_name="Edit"
+                control_id=self._config.TRADE_AMOUNT_CONTROL_ID,
+                class_name="Edit",
+                visible_only=True,
             )
             .window_text()
             .strip()
@@ -824,10 +868,18 @@ class ClientTrader(IClientTrader):
                 self._main.type_keys(shortcut)
             else:
                 raise
-        try:
-            self._main.type_keys("{F5}")
-        except Exception:
-            self._app.top_window().type_keys("{F5}")
+        if self._background_mode:
+            # 后台模式通过 Win32 消息发送 F5 刷新（VK_F5 = 0x74），避免抢前台焦点
+            try:
+                self._main.post_message(win32defines.WM_KEYDOWN, 0x74, 0)
+                self._main.post_message(win32defines.WM_KEYUP, 0x74, 0)
+            except Exception as ex:
+                logger.debug("background F5 post_message ignored: %s", ex)
+        else:
+            try:
+                self._main.type_keys("{F5}")
+            except Exception:
+                self._app.top_window().type_keys("{F5}")
         self.wait(sleep)
 
     def _switch_left_menus_by_shortcut(self, shortcut, sleep=0.5):

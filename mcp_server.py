@@ -73,6 +73,10 @@ def _parse_float(val: str, default: float) -> float:
 
 def get_config() -> Dict[str, Any]:
     """动态读取环境变量配置，便于测试与热切换。"""
+    background_mode = _parse_bool(
+        os.environ.get("EASYTRADER_BACKGROUND_MODE", "true"), default=True
+    )
+    default_grid = "wmcopy" if background_mode else "copy"
     return {
         "dry_run": _parse_bool(os.environ.get("DRY_RUN", "true"), default=True),
         "max_order_amount": _parse_float(
@@ -80,12 +84,13 @@ def get_config() -> Dict[str, Any]:
         ),
         "exe_path": os.environ.get("EASYTRADER_EXE_PATH", "").strip() or None,
         "broker": os.environ.get("EASYTRADER_BROKER", "ths").strip().lower(),
-        "grid_strategy": os.environ.get("EASYTRADER_GRID_STRATEGY", "copy")
+        "grid_strategy": os.environ.get("EASYTRADER_GRID_STRATEGY", default_grid)
         .strip()
         .lower(),
         "enable_type_keys": _parse_bool(
             os.environ.get("EASYTRADER_TYPE_KEYS", "false"), default=False
         ),
+        "background_mode": background_mode,
         "cache_ttl": _parse_float(
             os.environ.get("EASYTRADER_CACHE_TTL", "4.0"), default=4.0
         ),
@@ -148,6 +153,8 @@ def _get_trader(force_reconnect: bool = False) -> Any:
 
     trader = easytrader.use(cfg["broker"])
     _apply_grid_strategy(trader, cfg["grid_strategy"])
+    if hasattr(trader, "enable_background_mode"):
+        trader.enable_background_mode(cfg["background_mode"])
     if cfg["enable_type_keys"] and hasattr(trader, "enable_type_keys_for_editor"):
         trader.enable_type_keys_for_editor()
 
