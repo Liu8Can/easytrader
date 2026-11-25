@@ -54,6 +54,7 @@ if _REPO_ROOT not in sys.path:
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 import easytrader  # noqa: E402
 from easytrader import grid_strategies  # noqa: E402
+from easytrader.utils import ths_no_check  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 2. 安全开关与运行配置（通过环境变量注入）
@@ -76,8 +77,10 @@ def get_config() -> Dict[str, Any]:
     background_mode = _parse_bool(
         os.environ.get("EASYTRADER_BACKGROUND_MODE", "false"), default=False
     )
-    # 实测同花顺 5.0 对剪贴板复制(copy/wmcopy)易弹风控验证码，而 xls(Ctrl+S导出)稳定无验证码
-    default_grid = "xls"
+    # 同花顺 5.0：copy/wmcopy/xls 原本都会被「拷贝/保存数据」风控验证码拦截；
+    # 连接时自动写入 xiadan.ini 的 [AI_TRADE] no_check_sorc=1 关掉该风控后，
+    # wmcopy（后台 WM_COMMAND 0xE122 + 剪贴板，不抢前台焦点）即可稳定取到精确 TSV。
+    default_grid = "wmcopy"
     return {
         "dry_run": _parse_bool(os.environ.get("DRY_RUN", "true"), default=True),
         "max_order_amount": _parse_float(
@@ -92,6 +95,9 @@ def get_config() -> Dict[str, Any]:
             os.environ.get("EASYTRADER_TYPE_KEYS", "false"), default=False
         ),
         "background_mode": background_mode,
+        "ths_no_check": _parse_bool(
+            os.environ.get("EASYTRADER_THS_NO_CHECK", "true"), default=True
+        ),
         "cache_ttl": _parse_float(
             os.environ.get("EASYTRADER_CACHE_TTL", "4.0"), default=4.0
         ),
@@ -137,6 +143,8 @@ def _apply_grid_strategy(trader: Any, strategy_name: str) -> None:
     if strategy_cls is not None:
         trader.grid_strategy = strategy_cls
         trader._grid_strategy_instance = None
+    else:
+        logger.warning("未知的 grid_strategy=%s，沿用默认策略", strategy_name)
 
 
 def _get_trader(force_reconnect: bool = False) -> Any:
@@ -174,6 +182,16 @@ def _get_trader(force_reconnect: bool = False) -> Any:
     )
     trader.connect(exe_path=exe_path)
     _trader_instance = trader
+
+    # 关闭同花顺「复制/保存表格数据」风控验证码（写 xiadan.ini [AI_TRADE] no_check_sorc=1）
+    if cfg["broker"] == "ths" and cfg["ths_no_check"]:
+        try:
+            trader.enable_captcha_bypass()
+        except Exception as ex:
+            logger.warning(
+                "同花顺导出数据风控绕过未生效（将回退到易触发验证码的复制路径）: %s", ex
+            )
+
     return _trader_instance
 
 
@@ -287,6 +305,46 @@ def get_today_trades() -> str:
             return _json_ok(data, count=len(data) if isinstance(data, list) else 0)
         except Exception as ex:
             logger.exception("get_today_trades 失败")
+            return _json_err(str(ex))
+
+
+@mcp.tool()
+def get_client_info() -> str:
+    """
+    只读：报告客户端连接状态、表格读取策略与「复制/保存验证码风控」绕过状态。
+
+    用于 AI 自检：确认当前会话能否安全地高频读取持仓/委托/成交，
+    captcha_bypass.no_check_sorc == "1" 表示风控验证码已被关闭。
+    """
+    cfg = get_config()
+    with _gui_lock:
+        try:
+            trader = _get_trader()
+            state = getattr(trader, "captcha_bypass_state", None)
+            ini_flag = None
+            ini_path = None
+            if state:
+                ini_path = state.get("path")
+                ini_flag = ths_no_check.read_no_check_sor(ini_path)
+            return _json_ok(
+                {
+                    "broker": cfg["broker"],
+                    "grid_strategy": cfg["grid_strategy"],
+                    "background_mode": cfg["background_mode"],
+                    "dry_run": cfg["dry_run"],
+                    "max_order_amount": cfg["max_order_amount"],
+                    "exe_path": getattr(trader, "_exe_path", None),
+                    "main_window_title": trader.main.window_text(),
+                    "captcha_bypass": {
+                        "enabled": ini_flag == "1",
+                        "ini_path": ini_path,
+                        "no_check_sorc": ini_flag,
+                        "backup": (state or {}).get("backup"),
+                    },
+                }
+            )
+        except Exception as ex:
+            logger.exception("get_client_info 失败")
             return _json_err(str(ex))
 
 

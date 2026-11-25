@@ -10,13 +10,14 @@ import json
 import os
 import sys
 
-# 强制开启安全演练模式（默认使用实测免验证码的 xls 导出策略）
+# 强制开启安全演练模式（用 wmcopy 后台复制；验证码风控由 xiadan.ini 开关关闭）
 os.environ["DRY_RUN"] = "true"
 os.environ.setdefault("MAX_ORDER_AMOUNT", "10000")
 os.environ.setdefault("EASYTRADER_EXE_PATH", r"D:\同花顺软件\同花顺\xiadan.exe")
 os.environ.setdefault("EASYTRADER_BROKER", "ths")
-os.environ.setdefault("EASYTRADER_BACKGROUND_MODE", "false")
-os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "xls")
+os.environ.setdefault("EASYTRADER_BACKGROUND_MODE", "true")
+os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "wmcopy")
+os.environ.setdefault("EASYTRADER_THS_NO_CHECK", "true")
 
 import mcp_server
 
@@ -37,12 +38,15 @@ def main():
     print("Python:", sys.version)
     print("当前配置:", json.dumps(mcp_server.get_config(), ensure_ascii=False))
 
+    # 0. 自检：连接状态 + 验证码风控绕过是否生效
+    run_step("0. get_client_info（风控绕过自检）", mcp_server.get_client_info)
+
     # 1. 只读：资金查询 + 防抖缓存验证
     run_step("1a. get_balance（首次查询）", mcp_server.get_balance)
     run_step("1b. get_balance（4秒内二次查询，应命中 cached=true）", mcp_server.get_balance)
 
-    # 2. 只读：持仓查询（默认 xls 策略，免剪贴板验证码）
-    run_step("2. get_position（持仓查询 - xls 策略）", mcp_server.get_position)
+    # 2. 只读：持仓查询（wmcopy 后台复制，验证码已被关闭）
+    run_step("2. get_position（持仓查询 - wmcopy 策略）", mcp_server.get_position)
 
     # 3. 只读：当日委托与当日成交
     run_step("3. get_today_entrusts（当日委托）", mcp_server.get_today_entrusts)
