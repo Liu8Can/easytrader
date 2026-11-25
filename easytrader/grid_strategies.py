@@ -187,12 +187,13 @@ class WMCopy(Copy):
         except Exception:
             pass
         grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
-        self._trader.wait(0.25)
+        # 客户端写剪贴板可能占用 1~2 秒（16 列宽表），等久一点再读，避免 OpenClipboard 拒绝访问
+        self._trader.wait(0.35)
         content = self._get_clipboard_data()
         if not content or not content.strip():
             # 若后台 WM_COMMAND 未命中（少数券商皮肤），再短暂重试一次
             grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
-            self._trader.wait(0.35)
+            self._trader.wait(0.45)
             content = self._get_clipboard_data()
         return self._format_grid_data(content)
 

@@ -38,8 +38,10 @@ def is_non_trade_popup_title(title: str, main_title: str = "网上股票交易�
 
 
 class PopDialogHandler:
-    def __init__(self, app):
+    def __init__(self, app, background: bool = False):
         self._app = app
+        #: 后台模式：不调用 SetForegroundWindow / type_keys（两者都会抢前台焦点）
+        self._background = bool(background)
 
     @staticmethod
     def _set_foreground(window):
@@ -120,6 +122,10 @@ class PopDialogHandler:
             ).click()
 
     def _submit_by_shortcut(self):
+        if self._background:
+            # 后台模式不能按快捷键（type_keys 依赖前台焦点），改为给按钮发 BM_CLICK 消息
+            self._submit_by_click()
+            return
         self._set_foreground(self._app.top_window())
         self._app.top_window().type_keys("%Y", set_foreground=False)
 

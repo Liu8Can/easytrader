@@ -309,6 +309,7 @@ class ClientTrader(IClientTrader):
         """
         绕过 pywinauto .exists() 内部强行将 visible_only 设为 False 的坑，
         通过 descendants() + is_visible() 精准定位当前激活面板中的唯一可见控件。
+        若存在多个同 control_id 的可见控件，优先选择可用且有有效矩形区域的控件（后者通常为当前激活子面板）。
         """
         deadline = time.time() + timeout
         while True:
@@ -319,7 +320,30 @@ class ClientTrader(IClientTrader):
                     if ctrl.control_id() == control_id and ctrl.is_visible()
                 ]
                 if matches:
-                    return matches[0]
+                    if len(matches) > 1:
+                        logger.warning(
+                            "发现 %d 个可见 (%s, control_id=%s) 控件: %s",
+                            len(matches),
+                            class_name,
+                            control_id,
+                            [
+                                (
+                                    c.handle,
+                                    c.is_enabled(),
+                                    (c.rectangle().left, c.rectangle().top, c.rectangle().right, c.rectangle().bottom),
+                                    c.window_text(),
+                                )
+                                for c in matches
+                            ],
+                        )
+                    valid = [
+                        c
+                        for c in matches
+                        if c.is_enabled()
+                        and c.rectangle().width() > 0
+                        and c.rectangle().height() > 0
+                    ]
+                    return valid[-1] if valid else matches[-1]
             except Exception as ex:
                 logger.debug(
                     "find visible child (%s, %s) retry: %s", control_id, class_name, ex
@@ -785,6 +809,24 @@ class ClientTrader(IClientTrader):
             .window_text()
         )
 
+    @staticmethod
+    def _read_edit_text(editor) -> str:
+        """
+        读取 Win32 Edit 控件内容：pywinauto 的 window_text() 对跨进程 Edit 控件常返回空串，
+        必须优先调用 EditWrapper.text_block()（发送 WM_GETTEXTLENGTH + WM_GETTEXT）。
+        """
+        if editor is None:
+            return ""
+        try:
+            if hasattr(editor, "text_block"):
+                return (editor.text_block() or "").strip()
+        except Exception:
+            pass
+        try:
+            return (editor.window_text() or "").strip()
+        except Exception:
+            return ""
+
     def _set_and_verify_edit(
         self, control_id: int, expected_text: str, field_name: str, is_float: bool = False
     ):
@@ -813,33 +855,108 @@ class ClientTrader(IClientTrader):
         # 第 1 次尝试：标准方式写入
         self.type_edit_control_keys(editor, expected_str)
         self.wait(0.08)
-        actual = editor.window_text().strip()
+        actual = self._read_edit_text(editor)
         if _matches(actual):
             return
 
-        # 第 2 次尝试：使用剪贴板粘贴（^a^v），彻底免疫中文输入法与小数点吞字问题
+        # 第 2 次尝试：直接向控件句柄发送 WM_CHAR（兼容同花顺自定义证券代码框，免疫中文输入法与后台焦点限制）
         logger.warning(
-            "%s 输入框回读不一致 (actual=%r, expected=%r)，切换剪贴板粘贴重试...",
+            "%s 输入框回读不一致 (actual=%r, expected=%r)，切换 WM_CHAR 逐字写入重试...",
+            field_name,
+            actual,
+            expected_str,
+        )
+        self._send_chars_to_edit(editor, expected_str)
+        self.wait(0.1)
+        actual = self._read_edit_text(editor)
+        if _matches(actual):
+            return
+
+        # 第 3 次尝试：使用剪贴板粘贴（^a^v）
+        logger.warning(
+            "%s WM_CHAR 回读不一致 (actual=%r, expected=%r)，切换剪贴板粘贴重试...",
             field_name,
             actual,
             expected_str,
         )
         self._paste_into_edit(editor, expected_str)
         self.wait(0.1)
-        actual = editor.window_text().strip()
+        actual = self._read_edit_text(editor)
+        if _matches(actual):
+            return
+
+        # 第 4 次尝试：点击聚焦后前台逐键输入
+        if self._background_mode:
+            logger.warning(
+                "%s 回读仍不一致 (actual=%r, expected=%r)，后台模式不做前台输入回退，"
+                "请检查输入框是否被行情回填/输入法干扰",
+                field_name,
+                actual,
+                expected_str,
+            )
+            return
+        logger.warning(
+            "%s 剪贴板粘贴回读不一致 (actual=%r, expected=%r)，切换 click_input + type_keys 重试...",
+            field_name,
+            actual,
+            expected_str,
+        )
+        try:
+            editor.click_input()
+            self.wait(0.05)
+            editor.type_keys("^a{BACKSPACE}", set_foreground=True)
+            self.wait(0.05)
+            editor.type_keys(expected_str, set_foreground=True, pause=0.05)
+        except Exception as ex:
+            logger.debug("click_input + type_keys 失败: %s", ex)
+        self.wait(0.1)
+        actual = self._read_edit_text(editor)
         if not _matches(actual):
+            diag_edits = []
+            try:
+                for c in self._main.descendants(class_name="Edit"):
+                    if c.is_visible():
+                        r = c.rectangle()
+                        diag_edits.append(
+                            f"cid={c.control_id()},en={c.is_enabled()},rect=({r.left},{r.top},{r.right},{r.bottom}),txt={self._read_edit_text(c)!r}"
+                        )
+            except Exception as ex:
+                diag_edits.append(f"diag_err={ex}")
             raise exceptions.TradeError(
-                f"{field_name} 输入框校验失败：期望 {expected_str!r}，实际控件文本为 {actual!r}，已中止下单！"
+                f"{field_name} 输入框校验失败：期望 {expected_str!r}，实际控件文本为 {actual!r}，"
+                f"目标控件(cid={control_id},hwnd={editor.handle},en={editor.is_enabled()})，"
+                f"当前全部可见Edit=[{'; '.join(diag_edits[:12])}]，已中止下单！"
             )
 
+    def _send_chars_to_edit(self, editor, text: str):
+        """直接向 Win32 Edit 控件句柄发送全选清空 + WM_CHAR 逐字符消息，不依赖剪贴板和前台焦点。"""
+        try:
+            import win32con
+            import win32gui
+
+            hwnd = editor.handle
+            win32gui.SendMessage(hwnd, win32con.EM_SETSEL, 0, -1)
+            win32gui.SendMessage(hwnd, win32con.WM_CLEAR, 0, 0)
+            for ch in str(text):
+                win32gui.SendMessage(hwnd, win32con.WM_CHAR, ord(ch), 0)
+        except Exception as ex:
+            logger.debug("WM_CHAR 写入失败: %s", ex)
+
     def _paste_into_edit(self, editor, text: str):
-        """通过剪贴板全选粘贴写入输入框，避免中文输入法拦截小数点或数字。"""
+        """通过剪贴板全选粘贴写入输入框，避免中文输入法拦截小数点或数字。
+
+        后台模式不调用 ``set_focus``/``type_keys``（会抢前台焦点），改用
+        ``EM_SETSEL`` + ``WM_CHAR`` 纯消息写入。
+        """
+        if self._background_mode:
+            self._wm_char_into_edit(editor, text)
+            return
         try:
             import pyperclip
 
             pyperclip.copy(str(text))
             editor.set_focus()
-            editor.type_keys("^a^v", set_foreground=False)
+            editor.type_keys("^a^v", set_foreground=True)
         except Exception as ex:
             logger.debug("剪贴板粘贴回退到 set_edit_text: %s", ex)
             editor.set_edit_text(str(text))
@@ -873,9 +990,9 @@ class ClientTrader(IClientTrader):
         code_ed = self._find_visible_child(self._config.TRADE_SECURITY_CONTROL_ID, "Edit")
         price_ed = self._find_visible_child(self._config.TRADE_PRICE_CONTROL_ID, "Edit")
         amount_ed = self._find_visible_child(self._config.TRADE_AMOUNT_CONTROL_ID, "Edit")
-        final_code = code_ed.window_text().strip() if code_ed else ""
-        final_price = price_ed.window_text().strip() if price_ed else ""
-        final_amount = amount_ed.window_text().strip() if amount_ed else ""
+        final_code = self._read_edit_text(code_ed)
+        final_price = self._read_edit_text(price_ed)
+        final_amount = self._read_edit_text(amount_ed)
         if final_code != code or final_amount != amount_str:
             raise exceptions.TradeError(
                 f"下单前最终核对失败：code={final_code!r}(期望{code!r}), "
@@ -920,7 +1037,8 @@ class ClientTrader(IClientTrader):
 
     def type_edit_control_keys(self, editor, text):
         text_str = str(text)
-        if not self._editor_need_type_keys:
+        if not self._editor_need_type_keys or self._background_mode:
+            # 后台模式即使启用了 type_keys 也走 WM_SETTEXT，避免 set_focus 抢焦点
             editor.set_edit_text(text_str)
         else:
             editor.set_focus()
@@ -934,12 +1052,35 @@ class ClientTrader(IClientTrader):
             item.collapse()
 
     @perf_clock
+    def _select_left_menu_item(self, path):
+        """用 ``TVM_SELECTITEM`` 后台选中左侧菜单项。
+
+        pywinauto 的 ``tree.select(path)`` 第一步是 ``set_focus()``（源码注释：
+        “non-focused TreeView can ignore TVM_SELECTITEM”），这句会把同花顺窗口
+        激活到前台——这正是之前“后台模式”改动无效的原因。这里只发消息、
+        不碰焦点，实测页签照常切换、前台窗口不变。
+        """
+        tree = self._get_left_menus_handle().wrapper_object()
+        elem = tree.get_item(path)
+        if elem is None:
+            raise exceptions.TradeError(f"左侧菜单项未找到: {path}")
+        ret = tree.send_message(
+            win32defines.TVM_SELECTITEM, win32defines.TVGN_CARET, elem.elem
+        )
+        if ret != win32defines.TRUE:
+            raise exceptions.TradeError(f"TVM_SELECTITEM 失败: {path} (ret={ret})")
+        return True
+
     def _switch_left_menus(self, path, sleep=0.2):
         self._ensure_main_window_ready()
         self.close_pormpt_window_no_wait()
         self.close_pop_dialog()
         try:
-            self._get_left_menus_handle().get_item(path).select()
+            if self._background_mode:
+                # 后台模式：纯消息切页，不激活窗口
+                self._select_left_menu_item(path)
+            else:
+                self._get_left_menus_handle().get_item(path).select()
         except Exception as ex:
             # 容错：部分新版同花顺菜单名称略有差异，优先尝试常见快捷键回退
             shortcut_map = {
@@ -1010,7 +1151,7 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def _handle_pop_dialogs(self, handler_class=pop_dialog_handler.PopDialogHandler):
-        handler = handler_class(self._app)
+        handler = handler_class(self._app, background=self._background_mode)
         handled_any = False
 
         while self.is_exist_pop_dialog():

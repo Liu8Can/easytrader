@@ -75,7 +75,7 @@ def _parse_float(val: str, default: float) -> float:
 def get_config() -> Dict[str, Any]:
     """动态读取环境变量配置，便于测试与热切换。"""
     background_mode = _parse_bool(
-        os.environ.get("EASYTRADER_BACKGROUND_MODE", "false"), default=False
+        os.environ.get("EASYTRADER_BACKGROUND_MODE", "true"), default=True
     )
     # 同花顺 5.0：copy/wmcopy/xls 原本都会被「拷贝/保存数据」风控验证码拦截；
     # 连接时自动写入 xiadan.ini 的 [AI_TRADE] no_check_sorc=1 关掉该风控后，
