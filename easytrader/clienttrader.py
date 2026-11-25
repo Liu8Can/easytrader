@@ -858,6 +858,16 @@ class ClientTrader(IClientTrader):
         actual = self._read_edit_text(editor)
         if _matches(actual):
             return
+        if actual == "":
+            # 同花顺 5.0 部分版本的交易 Edit 控件开启了防读取保护，WM_GETTEXT 恒返回空串；
+            # 此时 set_edit_text 已写入成功，严禁再触发 WM_CHAR/type_keys 覆盖导致首位吞字（如 512000 -> 12000）。
+            logger.info(
+                "%s 输入框 (cid=%s) 不支持跨进程文本回读（返回空串），保持标准写入结果 %r",
+                field_name,
+                control_id,
+                expected_str,
+            )
+            return
 
         # 第 2 次尝试：直接向控件句柄发送 WM_CHAR（兼容同花顺自定义证券代码框，免疫中文输入法与后台焦点限制）
         logger.warning(
@@ -993,19 +1003,20 @@ class ClientTrader(IClientTrader):
         final_code = self._read_edit_text(code_ed)
         final_price = self._read_edit_text(price_ed)
         final_amount = self._read_edit_text(amount_ed)
-        if final_code != code or final_amount != amount_str:
+        if (final_code and final_code != code) or (final_amount and final_amount != amount_str):
             raise exceptions.TradeError(
                 f"下单前最终核对失败：code={final_code!r}(期望{code!r}), "
                 f"amount={final_amount!r}(期望{amount_str!r})，已中止下单！"
             )
-        try:
-            if abs(float(final_price) - float(price_str)) >= 1e-6:
-                raise ValueError("price mismatch")
-        except ValueError:
-            # 若价格在输入数量瞬间被行情覆写，最后再纠正一次并复核
-            self._set_and_verify_edit(
-                self._config.TRADE_PRICE_CONTROL_ID, price_str, "委托价格", is_float=True
-            )
+        if final_price:
+            try:
+                if abs(float(final_price) - float(price_str)) >= 1e-6:
+                    raise ValueError("price mismatch")
+            except ValueError:
+                # 若价格在输入数量瞬间被行情覆写，最后再纠正一次并复核
+                self._set_and_verify_edit(
+                    self._config.TRADE_PRICE_CONTROL_ID, price_str, "委托价格", is_float=True
+                )
 
     def _set_market_trade_params(self, security, amount, limit_price=None):
         self._type_edit_control_keys(
@@ -1094,16 +1105,13 @@ class ClientTrader(IClientTrader):
                 logger.warning(
                     "左侧菜单树定位 %s 失败 (%s)，回退使用快捷键 %s", path, ex, shortcut
                 )
-                self._main.type_keys(shortcut)
+                if not (self._background_mode and self._post_function_key(shortcut)):
+                    self._main.type_keys(shortcut)
             else:
                 raise
         if self._background_mode:
-            # 后台模式通过 Win32 消息发送 F5 刷新（VK_F5 = 0x74），避免抢前台焦点
-            try:
-                self._main.post_message(win32defines.WM_KEYDOWN, 0x74, 0)
-                self._main.post_message(win32defines.WM_KEYUP, 0x74, 0)
-            except Exception as ex:
-                logger.debug("background F5 post_message ignored: %s", ex)
+            # 后台模式投递 F5（VK_F5 = 0x74），不抢前台焦点
+            self._post_function_key("{F5}")
         else:
             try:
                 self._main.type_keys("{F5}")
@@ -1111,9 +1119,29 @@ class ClientTrader(IClientTrader):
                 self._app.top_window().type_keys("{F5}")
         self.wait(sleep)
 
+    def _post_function_key(self, shortcut):
+        """后台发送功能键（如 ``{F5}``）：只投递 WM_KEYDOWN/KEYUP，不需要前台焦点。
+
+        :return: 是否成功投递
+        """
+        match = re.search(r"\{F(\d{1,2})\}", shortcut or "")
+        if not match:
+            return False
+        vk = 0x70 + int(match.group(1)) - 1  # VK_F1 = 0x70
+        try:
+            self._main.post_message(win32defines.WM_KEYDOWN, vk, 0)
+            self._main.post_message(win32defines.WM_KEYUP, vk, 0)
+            return True
+        except Exception as ex:
+            logger.debug("后台功能键投递失败 %s: %s", shortcut, ex)
+            return False
+
     def _switch_left_menus_by_shortcut(self, shortcut, sleep=0.5):
         self.close_pop_dialog()
-        self._app.top_window().type_keys(shortcut)
+        if self._background_mode and self._post_function_key(shortcut):
+            logger.debug("后台模式投递功能键 %s，不抢前台焦点", shortcut)
+        else:
+            self._app.top_window().type_keys(shortcut)
         self.wait(sleep)
 
     @functools.lru_cache()
