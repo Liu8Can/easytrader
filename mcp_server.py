@@ -98,6 +98,9 @@ def get_config() -> Dict[str, Any]:
         "ths_no_check": _parse_bool(
             os.environ.get("EASYTRADER_THS_NO_CHECK", "true"), default=True
         ),
+        "ths_mute_cbas": _parse_bool(
+            os.environ.get("EASYTRADER_THS_MUTE_CBAS", "true"), default=True
+        ),
         "cache_ttl": _parse_float(
             os.environ.get("EASYTRADER_CACHE_TTL", "4.0"), default=4.0
         ),
@@ -191,6 +194,13 @@ def _get_trader(force_reconnect: bool = False) -> Any:
             logger.warning(
                 "同花顺导出数据风控绕过未生效（将回退到易触发验证码的复制路径）: %s", ex
             )
+
+    # 静音 CBAS 埋点：no_check_sorc 只免弹窗，复制/导出仍会经协议 2318 上报服务器
+    if cfg["broker"] == "ths" and cfg["ths_mute_cbas"]:
+        try:
+            trader.mute_cbas_telemetry()
+        except Exception as ex:
+            logger.warning("同花顺 CBAS 埋点静音未生效（复制行为仍会随 bp_log 上报）: %s", ex)
 
     return _trader_instance
 
@@ -326,6 +336,7 @@ def get_client_info() -> str:
             if state:
                 ini_path = state.get("path")
                 ini_flag = ths_no_check.read_no_check_sor(ini_path)
+            cbas = getattr(trader, "cbas_mute_state", None)
             return _json_ok(
                 {
                     "broker": cfg["broker"],
@@ -340,6 +351,15 @@ def get_client_info() -> str:
                         "ini_path": ini_path,
                         "no_check_sorc": ini_flag,
                         "backup": (state or {}).get("backup"),
+                    },
+                    "cbas_telemetry": {
+                        "muted": bool(cbas and (cbas.get("sites") or {}))
+                        and all(
+                            site.get("applied")
+                            for site in (cbas.get("sites") or {}).values()
+                        ),
+                        "sites": (cbas or {}).get("sites"),
+                        "note": "muted=true 表示复制/导出的 0xFF1/0xFF5 埋点已在本进程内截断",
                     },
                 }
             )

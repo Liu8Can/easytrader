@@ -92,6 +92,7 @@ class ClientTrader(IClientTrader):
         self._background_mode = False
         self._exe_path = None
         self._no_check_sorc = None
+        self._cbas_mute = None
 
     def enable_background_mode(self, enabled: bool = True):
         """开启无感后台模式：通过 Win32 消息交互，避免每次操作把同花顺强行弹到最前端抢焦点。"""
@@ -142,6 +143,42 @@ class ClientTrader(IClientTrader):
     def captcha_bypass_state(self):
         """最近一次 ``enable_captcha_bypass`` 的结果（未调用则为 None）。"""
         return self._no_check_sorc
+
+    def mute_cbas_telemetry(self, sites=("copy", "save")):
+        """静音同花顺 CBAS 行为上报（复制/导出的 ``0xFF1`` / ``0xFF5`` 埋点）。
+
+        ``no_check_sorc=1`` 只免掉本地验证码弹窗，**复制/导出仍会**把
+        「我复制了表格」连同 ``userid`` + 加密资金账号，经交易协议 ``2318``
+        （``cmd=bp_log``）上报服务器。本方法在客户端进程内把两处通知的
+        ``SendMessage`` 调用替换为 ``add esp,0xC; nop; nop``（5 字节，栈平衡），
+        复制/导出本身不受影响，仅不再产生 CBAS 记录。
+
+        * 只改内存、不动磁盘，客户端重启即恢复；
+        * 打补丁前校验 ``call`` 目标仍为 ``0x602b80``，客户端升级后不匹配则跳过；
+        * ``easytrader.utils.ths_cbas_mute.restore(pid)`` 可逐字节还原。
+
+        :return: 每个站点的应用结果
+        """
+        from easytrader.utils import ths_cbas_mute
+
+        try:
+            pid = int(self._app.process)
+        except Exception as ex:  # pragma: no cover - 进程信息不可用
+            raise exceptions.TradeError(f"无法获取同花顺进程 ID: {ex}") from ex
+
+        try:
+            result = ths_cbas_mute.apply(pid, sites=sites)
+        except ths_cbas_mute.CbasMuteError as ex:
+            logger.warning("静音 CBAS 埋点失败: %s", ex)
+            raise exceptions.TradeError(str(ex)) from ex
+
+        self._cbas_mute = result
+        return result
+
+    @property
+    def cbas_mute_state(self):
+        """最近一次 ``mute_cbas_telemetry`` 的结果（未调用则为 None）。"""
+        return self._cbas_mute
 
     @property
     def app(self):
