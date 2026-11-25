@@ -70,6 +70,26 @@
 插桩统计 `set_focus`/`click_input`/`type_keys` 调用 0 次。
 详见 [docs/ths_headless.md](docs/ths_headless.md)。
 
+### 6. 内嵌 API 桥：读写都由客户端自己发出（推荐，替代模拟点击）
+
+同花顺自带脚本框架（`script\经典策略\*.py` + `RES\python\python35.dll`），脚本里
+`from ths_api import *` 就能拿到 `xd.cmd(...)`（下单通道）与 `g_money` / `g_position` /
+`g_order` / `g_fullorder`（内存精确值）。本仓库据此提供一条**本机回环**通道：
+
+```powershell
+python install_bridge.py --subdir 经典策略   # 安装桥脚本 + 生成本机口令
+# 重启一次下单端（或打开策略面板）让它加载脚本，然后即自动生效
+```
+
+激活后 `get_client_info()` 显示 `api_bridge.available = true`、`data_channel = api_bridge`：
+
+- `get_balance` / `get_position` / `get_today_entrusts` / `buy` / `sell` / `cancel_entrust`
+  全部走桥：不切页签、不读剪贴板、不模拟任何点击；
+- 委托由 `xd.cmd(...)` 发出，**就是客户端自己的下单通道**（会话/加密/流水/埋点与人工一致）；
+- 桥只监听 `127.0.0.1` + token，默认 `DRY_RUN=true`；不可用时自动回退现有无头 GUI 通道。
+
+详见 [docs/ths_api_bridge.md](docs/ths_api_bridge.md)（含协议、字段映射、防封禁设计、回滚）。
+
 
 ---
 
