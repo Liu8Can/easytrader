@@ -306,3 +306,113 @@ PY
 ```
 
 判定成功的标志：`no_check_sorc=0` 时复制必弹窗、`=1` 时复制无弹窗且剪贴板为 16 列 TSV。
+
+
+---
+
+## 9. 关键追问：复制/导出成功了，会不会仍把行为提交给服务器？
+
+**会。而且和验证码完全无关。**
+
+### 9.1 证据：通知消息在闸门之前就发出了
+
+`sub_246B530`（复制）**函数入口**第一件事就是给主窗口发 ``WM_USER+0xFF1``，
+此时还没读 `no_check_sorc`、也没判断配额：
+
+```asm
+0x0246b561  push 0
+0x0246b563  push 0
+0x0246b565  push 0FF1h            ; 消息号：复制
+0x0246b56a  call unk_602800       ; 取主窗口 CWnd*
+0x0246b56f  mov  ecx, eax
+0x0246b571  call unk_602B80       ; SendMessage(0xFF1, 0, 0)  ← 埋点上报
+```
+
+导出同理，`sub_2479C90` 在文件写完后发 `0xFF5`：
+
+```asm
+0x02479cf6  push 0
+0x02479cf8  push 0
+0x02479cfa  push 0FF5h            ; 消息号：保存/导出
+0x02479cff  call unk_602800
+0x02479d04  mov  ecx, eax
+0x02479d06  call unk_602B80       ; SendMessage(0xFF5, 0, 0)
+```
+
+主窗口的接收函数与后续链路（与专项报告一致）：
+
+| 消息 | 接收函数 | 行为字段 | 之后 |
+| --- | --- | --- | --- |
+| `0xFF1` | `sub_11143E0` | `("copy","click_left",...)` | CBAS 组装 `sub_7B1BB0` → 发包 `sub_7B26E0` |
+| `0xFF5` | `sub_11144E0` | `("save","click_left",...)` | 同上 |
+| 验证码成功/失败 | 同一通道 | `copy.yzm.success` 等 | 同上（`no_check_sorc=1` 时不会走到） |
+
+`sub_7B1BB0` 会把 **`userid`（同花顺用户 ID）+ `fund_acct_en`（加密资金账号）+ `qdfs`**
+拼进记录（全局序号 `dword_34AC930` 自增），`sub_7B26E0` 打包成交易协议
+**功能号 `2318`（`cmd=bp_log`, `bp_data=...`）**，经主交易连接（`hssl.dll` 加密通道）
+发往服务器。也就是说：**本地只负责采集，画像与处置都在服务端，客户端没有任何
+“超次封号”逻辑，但服务端能看到你的复制/导出频次与时间分布。**
+
+### 9.2 实测：每复制一次，CBAS 序号 +1
+
+用 CBAS 组装函数里的全局序号 `dword_34AC930`（`.data`，运行时读到的是自增计数）
+作为探针，`no_check_sorc=1`、无弹窗的情况下：
+
+```text
+copy#1: cbas_seq 165 -> 166  delta=1
+copy#2: cbas_seq 166 -> 167  delta=1
+copy#3: cbas_seq 167 -> 168  delta=1
+```
+
+旁证：`dword_3478474`（复制免费额度）在 `.data` 初始值确为 `3`，每次放行都 `-1`——
+所以“前 3 次不弹窗、第 4 次起必弹”的行为也能被解释；且该额度**没有任何恢复逻辑**。
+
+### 9.3 防范：把两处通知在客户端内截断（`ths_cbas_mute`）
+
+两处 `SendMessage` 的机器码形态完全一致，都是 `call 0x602B80`
+（`CWnd::SendMessage(UINT,WPARAM,LPARAM)`，`ret 0xC`）。把它换成
+`add esp,0xC; nop; nop`（5 字节）即可：栈平衡等价于“调用被跳过”，
+后续代码不使用 `eax`，复制/导出本身不受影响。
+
+| 站点 | VA | 原字节 | 补丁后 |
+| --- | --- | --- | --- |
+| 复制 `0xFF1` | `0x246B571` | `e8 0a 76 19 fe` | `83 c4 0c 90 90` |
+| 导出 `0xFF5` | `0x2479D06` | `e8 75 8e 18 fe` | `83 c4 0c 90 90` |
+
+实现见 `easytrader/utils/ths_cbas_mute.py`（运行时内存补丁，不改磁盘，可还原）：
+
+```python
+from easytrader.utils import ths_cbas_mute
+ths_cbas_mute.apply(pid)      # 打补丁（先校验 call 目标确为 0x602b80，否则跳过）
+ths_cbas_mute.status(pid)     # -> {"muted": True, ...}
+ths_cbas_mute.restore(pid)    # 逐字节还原（原始指令由签名确定性重建，跨进程可用）
+```
+
+实测闭环：
+
+```text
+apply  → copy delta = 0   （剪贴板仍拿到 5 行 / 16 列精确 TSV）
+restore→ copy delta = 1
+apply  → copy delta = 0
+```
+
+注意事项：
+
+1. **它只截断“复制/导出”这两条埋点**，不影响下单、查询、资金等任何功能；
+2. **页签切换仍会产生 CBAS 页面埋点**（实测切换一次 +1）。那是任何用户点“查询[F4]”
+   都会产生的正常浏览行为，不携带“抓数”语义；对照实验（只切页 vs 切页+复制）
+   的增量完全相同，说明复制本身已归零。若要连页面埋点一起静音，入口在
+   `CBAS_PageName` / `cbaspagename` / `set_cbas` 那一套（`sub_7B1BB0` 的上游调用），
+   属于更激进的改动，本仓库未启用。
+3. 客户端重启后补丁失效（内存态），MCP 每次 `connect()` 会自动重打（幂等，
+   已静音时不写）。
+4. 与 `no_check_sorc` 的关系：**两者互补**——`no_check_sorc` 解决“弹窗挡路”，
+   `ths_cbas_mute` 解决“行为回传”。只做前者，等于“门开了，但门口装了摄像头”。
+
+### 9.4 更保守的运营侧建议（不改客户端也能降风险）
+
+* 把自动化跑在**独立的、只读用途的账户**上，不与主交易账户混用；
+* 对 `position/entrusts/trades` 做**低频 + 缓存**（本仓库已有 4s 防抖缓存），
+  避免 0.3s 级的高频轮询；
+* 不在券商行情/交易高峰段做批量抓取；
+* 交易与查询分离：下单走人工确认（`DRY_RUN`），数据读取才用自动化。

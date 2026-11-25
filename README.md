@@ -47,6 +47,13 @@
 完整逆向过程、指令级证据与压测记录见 **[docs/ths_captcha_bypass.md](docs/ths_captcha_bypass.md)**。
 
 > 实测：`no_check_sorc=0` 复制必弹验证码；`=1` 后 10 次 0.3s 间隔的后台复制 10/10 成功、零弹窗。
+>
+> **注意：开关只免弹窗，免不了上报。** 复制/导出在闸门之前就会发 `0xFF1`/`0xFF5`
+> 埋点，经 CBAS 打包成交易协议 `2318`（`cmd=bp_log`，携带 `userid` + 加密资金账号）
+> 发往服务器。本仓库因此额外提供 `easytrader/utils/ths_cbas_mute.py`：在客户端进程内把
+> 两处 `SendMessage` 调用替换为 `add esp,0xC; nop; nop`（5 字节，可还原），
+> 复制/导出照常工作而不再产生 CBAS 记录（实测：复制导致的 CBAS 序号增量由 1 变 0）。
+> 详见 [docs/ths_captcha_bypass.md](docs/ths_captcha_bypass.md) 第 9 节。
 
 
 ---
@@ -81,6 +88,7 @@ python verify_live.py
         "EASYTRADER_BROKER": "ths",
         "EASYTRADER_GRID_STRATEGY": "wmcopy",
         "EASYTRADER_THS_NO_CHECK": "true",
+        "EASYTRADER_THS_MUTE_CBAS": "true",
         "EASYTRADER_BACKGROUND_MODE": "true",
         "EASYTRADER_CACHE_TTL": "4.0",
         "PYTHONUTF8": "1",
@@ -101,6 +109,7 @@ python verify_live.py
 | `EASYTRADER_BROKER` | `ths` | 客户端类型，支持 `ths` / `universal_client` / `miniqmt` 等 |
 | `EASYTRADER_GRID_STRATEGY` | `wmcopy` | 表格读取策略，可选 `wmcopy`（后台消息复制，推荐）/ `copy` / `xls` |
 | `EASYTRADER_THS_NO_CHECK` | `true` | 连接时写入 `xiadan.ini` 的 `[AI_TRADE] no_check_sorc=1`，关闭复制/保存验证码风控 |
+| `EASYTRADER_THS_MUTE_CBAS` | `true` | 连接时静音客户端内 CBAS 复制/导出埋点（`0xFF1`/`0xFF5`），阻止行为随 `bp_log` 上报 |
 | `EASYTRADER_CACHE_TTL` | `4.0` | `get_balance` / `get_position` 防抖缓存时间（秒） |
 | `EASYTRADER_BACKGROUND_MODE` | `false` | 是否避免调用 `SetForegroundWindow` 抢前台焦点 |
 
