@@ -55,6 +55,21 @@
 > 复制/导出照常工作而不再产生 CBAS 记录（实测：复制导致的 CBAS 序号增量由 1 变 0）。
 > 详见 [docs/ths_captcha_bypass.md](docs/ths_captcha_bypass.md) 第 9 节。
 
+### 5. 无头/后台运行：调用不再把客户端拉到前台
+
+之前那次“后台模式”只挡了 easytrader 自己的 `SetForegroundWindow`，**没挡 pywinauto
+`TreeViewWrapper.select()` 内部的 `set_focus()`**，所以看不到效果。现在改为：
+
+- **切页**：`TVM_SELECTITEM` 纯消息切换左侧菜单（不再 `select()` → `set_focus()`）；
+- **弹窗**：`BM_CLICK` 点按钮，不按 `%Y` 快捷键、不做 `SetForegroundWindow`；
+- **输入框**：`WM_SETTEXT` / `EM_SETSEL+WM_CHAR`，后台模式禁用 `click_input`/`type_keys` 回退；
+- **复制**：`WM_COMMAND 0xE122` + 剪贴板（本来就不需要焦点）；刷新用 `post_message`。
+
+实测：把同花顺完全遮挡后，`get_position` / `get_today_entrusts` / `get_today_trades` /
+`buy(DRY_RUN)` / `sell(DRY_RUN)` / `get_balance` 全部正常，前台窗口始终不变，
+插桩统计 `set_focus`/`click_input`/`type_keys` 调用 0 次。
+详见 [docs/ths_headless.md](docs/ths_headless.md)。
+
 
 ---
 
@@ -111,7 +126,7 @@ python verify_live.py
 | `EASYTRADER_THS_NO_CHECK` | `true` | 连接时写入 `xiadan.ini` 的 `[AI_TRADE] no_check_sorc=1`，关闭复制/保存验证码风控 |
 | `EASYTRADER_THS_MUTE_CBAS` | `true` | 连接时静音客户端内 CBAS 复制/导出埋点（`0xFF1`/`0xFF5`），阻止行为随 `bp_log` 上报 |
 | `EASYTRADER_CACHE_TTL` | `4.0` | `get_balance` / `get_position` 防抖缓存时间（秒） |
-| `EASYTRADER_BACKGROUND_MODE` | `false` | 是否避免调用 `SetForegroundWindow` 抢前台焦点 |
+| `EASYTRADER_BACKGROUND_MODE` | `true` | 无头/后台模式：不抢前台焦点（切页走 `TVM_SELECTITEM`、弹窗用 `BM_CLICK`、输入走 `WM_SETTEXT`） |
 
 ---
 
