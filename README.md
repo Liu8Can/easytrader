@@ -1,38 +1,89 @@
-# easytrader
+# easytrader (Python 3.13 + 同花顺 5.0 + MCP 维护版)
 
-[![Package](https://img.shields.io/pypi/v/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
-[![License](https://img.shields.io/github/license/shidenggui/easytrader.svg)](https://github.com/shidenggui/easytrader/blob/master/LICENSE)
+> 本仓库 Fork 自 [shidenggui/easytrader](https://github.com/shidenggui/easytrader)（原仓库已停止维护），面向 **Python 3.13 + 新版同花顺 PC 下单端（网上股票交易系统 5.0）** 进行长期本地维护与现代化升级，并新增标准 **Stdio MCP Server** 供 AI Agent 调用。
 
-* 进行股票量化交易
-* 通用的同花顺客户端模拟操作
-* 支持券商的 [miniqmt](https://easytrader.readthedocs.io/zh-cn/master/miniqmt/) 官方量化接口
-* 支持雪球组合调仓和跟踪
-* 支持远程操作客户端
-* 支持跟踪 `joinquant`, `ricequant` 的模拟交易
+---
 
+## 本分支核心升级与修复
 
-### 微信群以及公众号
+### 1. Python 3.13 与依赖现代化
+- 清理 `requirements.txt` 与 `setup.py` 中 2018 年的旧版本强锁，升级兼容 **Python 3.10 ～ 3.13**、`pywinauto >= 0.6.8`、`pandas >= 2.1`、`Pillow >= 10.0`、`mcp >= 1.0`。
+- 修复 `easytrader/utils/win_gui.py` 在 `pywinauto 0.6.9` 回退到 `win32gui` 时的句柄类型（`HWND`）转换问题。
+- 替换 `pop_dialog_handler.py` 中已废弃的 `Window_()` / `ChildWindow()` API，并修复 Pillow 10+ 下 `captcha.py` 像素值越界问题。
 
-欢迎大家扫码关注公众号「食灯鬼」，一起交流。进群可通过菜单加我好友，备注量化。
+### 2. 新版同花顺（`xiadan.exe` / 网上股票交易系统 5.0）适配与上游高频 Issue 修复
+- **免密码直连**：`connect()` 支持直接接管已手动登录的 `xiadan.exe`（支持按路径、PID 或窗口标题自动定位，并附带 Windows UIPI 管理员权限隔离诊断提示）。
+- **#457 / #506（假 `success` / 最小化报错）**：操作前自动还原最小化窗口；下单前逐项回读校验**代码、价格、数量** 3 个输入框；下单后禁止盲目返回 `success`，优先校验确认弹窗单号，无弹窗时反查 `today_entrusts` 核实，失败则抛出 `TradeError`。
+- **#522（ETF 3 位小数价格出错）**：完整保留 `159915` 等 ETF 的 3 位小数（如 `2.259`），写入后自动回读校验，受输入法或行情回填干扰时自动切换剪贴板全选粘贴重试。
+- **#376（弹窗干扰操作）**：查询与下单前自动检测并关闭广告、公告、新股提醒、成交回报等非交易干扰弹窗。
+- **#529（`balance` 可用金额偶发为 0）**：读取资金栏若遇到全 0 或“可用金额为 0 但总资产非 0”的刷新延迟，自动等待 `0.3s` 最多重试 3 次。
+- **#514 / #524（新版取消交易所下拉框）**：`_set_stock_exchange_type()` 检测控件不存在时安全跳过；修复 `joinquant_follower.py` `price` 字符串转换笔误。
+- **多面板隐藏控件歧义修复**：绕过 `pywinauto` `.exists()` 强设 `visible_only=False` 的坑，通过 `descendants()` + `control_id()` + `is_visible()` 精准定位当前可见面板控件。
 
-![公众号二维码](https://camo.githubusercontent.com/6fad032c27b30b68a9d942ae77f8cc73933b95cea58e684657d31b94a300afd5/68747470733a2f2f67697465652e636f6d2f73686964656e676775692f6173736574732f7261772f6d61737465722f755069632f6d702d71722e706e67)
+### 3. 标准 Stdio MCP Server（`mcp_server.py`）
+- 基于 `mcp.server.fastmcp.FastMCP` 实现，所有日志与 `pywinauto` 警告强制输出至 `stderr`，保证 `stdout` 仅输出纯净 MCP JSON-RPC 协议。
+- 暴露 7 个工具（均返回结构化 JSON）：
+  - **只读**：`get_balance`、`get_position`、`get_today_entrusts`、`get_today_trades`
+  - **交易**：`buy(stock_code, price, amount)`、`sell(stock_code, price, amount)`、`cancel_entrust(entrust_no)`
+- 内置安全护栏与防抖：
+  - `DRY_RUN`（默认 `true`）：仅校验参数与当前可见面板控件，绝不点击确认下单。
+  - `MAX_ORDER_AMOUNT`（默认 `10000`）：单笔委托金额超限直接拦截。
+  - `EASYTRADER_CACHE_TTL`（默认 `4.0` 秒）：`get_balance` / `get_position` 防抖短缓存，真实交易后自动失效。
 
-若二维码因 Github 网络无法打开，请点击[公众号二维码](https://camo.githubusercontent.com/6fad032c27b30b68a9d942ae77f8cc73933b95cea58e684657d31b94a300afd5/68747470733a2f2f67697465652e636f6d2f73686964656e676775692f6173736574732f7261772f6d61737465722f755069632f6d702d71722e706e67)直接打开图片。
+---
 
-### Author
+## 快速开始
 
-> Blog [@shidenggui](https://shidenggui.com) · Weibo [@食灯鬼](https://www.weibo.com/u/1651274491) · Twitter [@shidenggui](https://twitter.com/shidenggui)
+### 1. 安装依赖
+```bash
+pip install -r requirements.txt
+```
 
-### 相关
+### 2. 实机联调验收（安全演练模式）
+先手动打开并登录同花顺下单端（`xiadan.exe`），再运行：
+```powershell
+python verify_live.py
+```
+> 注意：若同花顺以管理员身份运行，请确保 PowerShell / MCP 客户端也以同等权限运行，否则会受 Windows UIPI 权限隔离影响。
 
-* [easyquotation 实时获取全市场股票行情](https://github.com/shidenggui/easyquotation)
-* [easyquant 简单的量化框架](https://github.com/shidenggui/easyquant)
+### 3. 客户端 `mcpServers` 配置示例
+```json
+{
+  "mcpServers": {
+    "easytrader-ths": {
+      "command": "python",
+      "args": [
+        "D:\\Documents\\反重力\\easytrader\\mcp_server.py"
+      ],
+      "env": {
+        "DRY_RUN": "true",
+        "MAX_ORDER_AMOUNT": "10000",
+        "EASYTRADER_EXE_PATH": "D:\\同花顺软件\\同花顺\\xiadan.exe",
+        "EASYTRADER_BROKER": "ths",
+        "EASYTRADER_GRID_STRATEGY": "xls",
+        "EASYTRADER_CACHE_TTL": "4.0",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}
+```
 
+### 4. 环境变量说明
 
-### 模拟交易
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `DRY_RUN` | `true` | 安全演练开关；设为 `false` 才允许真实点击下单/撤单 |
+| `MAX_ORDER_AMOUNT` | `10000` | 单笔委托金额上限（元），超限直接拦截 |
+| `EASYTRADER_EXE_PATH` | 自动探测 | `xiadan.exe` 路径；留空时自动匹配“网上股票交易系统5.0”窗口 |
+| `EASYTRADER_BROKER` | `ths` | 客户端类型，支持 `ths` / `universal_client` / `miniqmt` 等 |
+| `EASYTRADER_GRID_STRATEGY` | `xls` | 表格读取策略，可选 `xls` / `copy` / `wmcopy` |
+| `EASYTRADER_CACHE_TTL` | `4.0` | `get_balance` / `get_position` 防抖缓存时间（秒） |
+| `EASYTRADER_BACKGROUND_MODE` | `false` | 是否避免调用 `SetForegroundWindow` 抢前台焦点 |
 
-* 雪球组合 by @[haogefeifei](https://github.com/haogefeifei)（[说明](docs/xueqiu.md)）
+---
 
-### 使用文档
-
-[中文文档](https://easytrader.readthedocs.io/)
+## 原项目致谢
+- 上游项目：[shidenggui/easytrader](https://github.com/shidenggui/easytrader)（BSD License）
+- 原中文文档：[https://easytrader.readthedocs.io/](https://easytrader.readthedocs.io/)
