@@ -406,54 +406,57 @@ def get_client_info() -> str:
     cfg = get_config()
     with _gui_lock:
         bridge = _get_bridge()
-        bridge_info = {
-            "available": bridge is not None,
-            "port": getattr(bridge, "port", None),
-            "note": "available=true 时 balance/position/entrusts/buy/sell/cancel 均走客户端内嵌 API",
-        }
-        # GUI 信息尽量给，但不因 GUI 不可用而整体失败
-        gui_info: Dict[str, Any] = {}
-        try:
-            trader = _get_trader()
-            state = getattr(trader, "captcha_bypass_state", None)
-            ini_flag = None
-            ini_path = None
-            if state:
-                ini_path = state.get("path")
-                ini_flag = ths_no_check.read_no_check_sor(ini_path)
-            cbas = getattr(trader, "cbas_mute_state", None)
-            gui_info = {
-                "exe_path": getattr(trader, "_exe_path", None),
-                "main_window_title": trader.main.window_text(),
-                "captcha_bypass": {
-                    "enabled": ini_flag == "1",
-                    "ini_path": ini_path,
-                    "no_check_sorc": ini_flag,
-                    "backup": (state or {}).get("backup"),
-                },
-                "cbas_telemetry": {
-                    "muted": bool(cbas and (cbas.get("sites") or {}))
-                    and all(
-                        site.get("applied")
-                        for site in (cbas.get("sites") or {}).values()
-                    ),
-                    "sites": (cbas or {}).get("sites"),
-                    "note": "muted=true 表示复制/导出的 0xFF1/0xFF5 埋点已在本进程内截断",
-                },
-            }
-        except Exception as ex:
-            gui_info = {"error": str(ex)}
-
-        payload = {
+        payload: Dict[str, Any] = {
             "broker": cfg["broker"],
             "grid_strategy": cfg["grid_strategy"],
             "background_mode": cfg["background_mode"],
             "dry_run": cfg["dry_run"],
             "max_order_amount": cfg["max_order_amount"],
             "data_channel": "api_bridge" if bridge is not None else "gui",
-            "api_bridge": bridge_info,
+            "api_bridge": {
+                "available": bridge is not None,
+                "port": getattr(bridge, "port", None),
+                "note": "available=true 时 balance/position/entrusts/buy/sell/cancel 均走客户端内嵌 API",
+            },
         }
-        payload.update(gui_info)
+
+        if bridge is None:
+            # 只有走 GUI 时才需要连接客户端并汇报验证码/埋点状态
+            try:
+                trader = _get_trader()
+                state = getattr(trader, "captcha_bypass_state", None)
+                ini_flag = None
+                ini_path = None
+                if state:
+                    ini_path = state.get("path")
+                    ini_flag = ths_no_check.read_no_check_sor(ini_path)
+                cbas = getattr(trader, "cbas_mute_state", None)
+                payload.update(
+                    {
+                        "exe_path": getattr(trader, "_exe_path", None),
+                        "main_window_title": trader.main.window_text(),
+                        "captcha_bypass": {
+                            "enabled": ini_flag == "1",
+                            "ini_path": ini_path,
+                            "no_check_sorc": ini_flag,
+                            "backup": (state or {}).get("backup"),
+                        },
+                        "cbas_telemetry": {
+                            "muted": bool(cbas and (cbas.get("sites") or {}))
+                            and all(
+                                site.get("applied")
+                                for site in (cbas.get("sites") or {}).values()
+                            ),
+                            "sites": (cbas or {}).get("sites"),
+                            "note": "muted=true 表示复制/导出的 0xFF1/0xFF5 埋点已在本进程内截断",
+                        },
+                    }
+                )
+            except Exception as ex:
+                payload["gui_error"] = str(ex)
+        else:
+            payload["gui"] = {"skipped": "api_bridge 可用，GUI 通道未启用"}
+
         return _json_ok(payload)
 
 
@@ -487,7 +490,7 @@ def buy(stock_code: str, price: float, amount: int) -> str:
                 result["source"] = "api_bridge"
                 if not cfg["dry_run"]:
                     _invalidate_read_cache()
-                return _json_ok(result, dry_run=cfg["dry_run"])
+                return _json_ok(result, dry_run=cfg["dry_run"], source="api_bridge")
             trader = _get_trader()
             if cfg["dry_run"]:
                 result = trader.buy(stock_code, price, amount, dry_run=True)
@@ -533,7 +536,7 @@ def sell(stock_code: str, price: float, amount: int) -> str:
                 result["source"] = "api_bridge"
                 if not cfg["dry_run"]:
                     _invalidate_read_cache()
-                return _json_ok(result, dry_run=cfg["dry_run"])
+                return _json_ok(result, dry_run=cfg["dry_run"], source="api_bridge")
             trader = _get_trader()
             if cfg["dry_run"]:
                 result = trader.sell(stock_code, price, amount, dry_run=True)
