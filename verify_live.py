@@ -10,13 +10,13 @@ import json
 import os
 import sys
 
-# 强制开启安全演练模式（默认使用实测无验证码的 copy 策略）
+# 强制开启安全演练模式（默认使用实测免验证码的 xls 导出策略）
 os.environ["DRY_RUN"] = "true"
 os.environ.setdefault("MAX_ORDER_AMOUNT", "10000")
 os.environ.setdefault("EASYTRADER_EXE_PATH", r"D:\同花顺软件\同花顺\xiadan.exe")
 os.environ.setdefault("EASYTRADER_BROKER", "ths")
 os.environ.setdefault("EASYTRADER_BACKGROUND_MODE", "false")
-os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "copy")
+os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "xls")
 
 import mcp_server
 
@@ -41,14 +41,8 @@ def main():
     run_step("1a. get_balance（首次查询）", mcp_server.get_balance)
     run_step("1b. get_balance（4秒内二次查询，应命中 cached=true）", mcp_server.get_balance)
 
-    # 2. 只读：持仓查询（先测 copy；若报错或被验证码阻断，自动尝试 xls）
-    pos = run_step("2. get_position（持仓查询 - copy 策略）", mcp_server.get_position)
-    if not pos.get("ok"):
-        print("\n[提示] copy 策略失败，自动切换 xls 策略复测...")
-        os.environ["EASYTRADER_GRID_STRATEGY"] = "xls"
-        mcp_server._trader_instance = None
-        mcp_server._invalidate_read_cache()
-        run_step("2b. get_position（持仓查询 - xls 策略）", mcp_server.get_position)
+    # 2. 只读：持仓查询（默认 xls 策略，免剪贴板验证码）
+    run_step("2. get_position（持仓查询 - xls 策略）", mcp_server.get_position)
 
     # 3. 只读：当日委托与当日成交
     run_step("3. get_today_entrusts（当日委托）", mcp_server.get_today_entrusts)

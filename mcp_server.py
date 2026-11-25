@@ -76,7 +76,8 @@ def get_config() -> Dict[str, Any]:
     background_mode = _parse_bool(
         os.environ.get("EASYTRADER_BACKGROUND_MODE", "false"), default=False
     )
-    default_grid = "copy"
+    # 实测同花顺 5.0 对剪贴板复制(copy/wmcopy)易弹风控验证码，而 xls(Ctrl+S导出)稳定无验证码
+    default_grid = "xls"
     return {
         "dry_run": _parse_bool(os.environ.get("DRY_RUN", "true"), default=True),
         "max_order_amount": _parse_float(

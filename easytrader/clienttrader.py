@@ -229,10 +229,8 @@ class ClientTrader(IClientTrader):
             try:
                 matches = [
                     ctrl
-                    for ctrl in self._main.descendants(
-                        control_id=control_id, class_name=class_name
-                    )
-                    if ctrl.is_visible()
+                    for ctrl in self._main.descendants(class_name=class_name)
+                    if ctrl.control_id() == control_id and ctrl.is_visible()
                 ]
                 if matches:
                     return matches[0]
