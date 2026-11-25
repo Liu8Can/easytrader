@@ -4,8 +4,37 @@ import time
 from typing import Optional
 
 from easytrader import exceptions
+from easytrader.log import logger
 from easytrader.utils.perf import perf_clock
 from easytrader.utils.win_gui import SetForegroundWindow, ShowWindow, win32defines
+
+
+NON_TRADE_POPUP_KEYWORDS = (
+    "广告",
+    "公告",
+    "新股",
+    "中签",
+    "风险提示",
+    "弹出窗口",
+    "成交回报",
+    "消息提示",
+    "升级",
+    "活动",
+    "通知",
+)
+
+
+def is_non_trade_popup_title(title: str, main_title: str = "网上股票交易系统") -> bool:
+    """判断弹窗标题是否属于非交易确认类干扰弹窗（广告/公告/新股提醒/成交回报等，Issue #376）。"""
+    t = (title or "").strip()
+    if main_title in t or "网上股票交易系统" in t:
+        return False
+    # 排除交易确认与验证码弹窗，避免误关正在进行的交易
+    if any(k in t for k in ("委托确认", "撤单确认", "验证码", "另存为")):
+        return False
+    if t == "" or any(k in t for k in NON_TRADE_POPUP_KEYWORDS):
+        return True
+    return True
 
 
 class PopDialogHandler:
@@ -14,10 +43,13 @@ class PopDialogHandler:
 
     @staticmethod
     def _set_foreground(window):
-        if window.has_style(win32defines.WS_MINIMIZE):  # if minimized
-            ShowWindow(window.wrapper_object(), 9)  # restore window state
-        else:
-            SetForegroundWindow(window.wrapper_object())  # bring to front
+        try:
+            if window.has_style(win32defines.WS_MINIMIZE):  # if minimized
+                ShowWindow(window.wrapper_object(), 9)  # restore window state
+            else:
+                SetForegroundWindow(window.wrapper_object())  # bring to front
+        except Exception as ex:
+            logger.debug("set foreground failed: %s", ex)
 
     @perf_clock
     def handle(self, title):
@@ -35,17 +67,55 @@ class PopDialogHandler:
         return {"message": "unknown message: {}".format(content)}
 
     def _extract_content(self):
-        return self._app.top_window().Static.window_text()
+        top = self._app.top_window()
+        # 优先尝试同花顺常见的弹窗内容控件 ID (1004)
+        try:
+            ctrl = top.child_window(control_id=1004, class_name="Static")
+            if ctrl.exists(timeout=0.2):
+                text = ctrl.window_text().strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        # 回退：遍历所有 Static 子控件，避免多 Static 时触发 ElementAmbiguousError
+        try:
+            texts = []
+            for ctrl in top.descendants(class_name="Static"):
+                txt = ctrl.window_text().strip()
+                if txt and txt not in {"提示", "提示信息", "委托确认", "撤单确认"}:
+                    texts.append(txt)
+            if texts:
+                return " ".join(texts)
+        except Exception:
+            pass
+
+        try:
+            return top.Static.window_text()
+        except Exception:
+            return ""
 
     @staticmethod
     def _extract_entrust_id(content):
-        return re.search(r"[\da-zA-Z]+", content).group()
+        match = re.search(r"[\da-zA-Z]+", content or "")
+        return match.group() if match else ""
 
     def _submit_by_click(self):
+        top = self._app.top_window()
+        for btn_text in ("确定", "是(Y)", "是", "确定(Y)"):
+            try:
+                btn = top.child_window(title=btn_text, class_name="Button")
+                if btn.exists(timeout=0.2):
+                    btn.click()
+                    return
+            except Exception:
+                continue
+
+        # 兼容旧版 best_match 回退（替换已废弃的 Window_ / ChildWindow）
         try:
-            self._app.top_window()["确定"].click()
-        except Exception as ex:
-            self._app.Window_(best_match="Dialog", top_level_only=True).ChildWindow(
+            top["确定"].click()
+        except Exception:
+            self._app.window(best_match="Dialog", top_level_only=True).child_window(
                 best_match="确定"
             ).click()
 
@@ -89,7 +159,7 @@ class TradePopDialogHandler(PopDialogHandler):
             if "成功" in content:
                 entrust_no = self._extract_entrust_id(content)
                 self._submit_by_click()
-                return {"entrust_no": entrust_no}
+                return {"entrust_no": entrust_no, "message": content}
 
             self._submit_by_click()
             time.sleep(0.05)

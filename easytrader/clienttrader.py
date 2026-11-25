@@ -13,13 +13,14 @@ import hashlib, binascii
 import easyutils
 from pywinauto import findwindows, timings
 
-from easytrader import grid_strategies, pop_dialog_handler, refresh_strategies
+from easytrader import exceptions, grid_strategies, pop_dialog_handler, refresh_strategies
 from easytrader.config import client
 from easytrader.grid_strategies import IGridStrategy
 from easytrader.log import logger
 from easytrader.refresh_strategies import IRefreshStrategy
 from easytrader.utils.misc import file2dict
 from easytrader.utils.perf import perf_clock
+from easytrader.utils.win_gui import SetForegroundWindow, ShowWindow, win32defines
 
 if not sys.platform.startswith("darwin"):
     import pywinauto
@@ -101,22 +102,85 @@ class ClientTrader(IClientTrader):
     def config(self):
         return self._config
 
-    def connect(self, exe_path=None, **kwargs):
+    def connect(self, exe_path=None, title=None, process=None, **kwargs):
         """
-        直接连接登陆后的客户端
-        :param exe_path: 客户端路径类似 r'C:\\htzqzyb2\\xiadan.exe', 默认 r'C:\\htzqzyb2\\xiadan.exe'
-        :return:
-        """
-        connect_path = exe_path or self._config.DEFAULT_EXE_PATH
-        if connect_path is None:
-            raise ValueError(
-                "参数 exe_path 未设置，请设置客户端对应的 exe 地址,类似 C:\\客户端安装目录\\xiadan.exe"
-            )
+        直接连接已手动登录好的同花顺客户端（无需在配置中写死账号密码）。
 
-        self._app = pywinauto.Application().connect(path=connect_path, timeout=10)
+        优先级：
+        1. 指定 process (PID)
+        2. 指定 exe_path（若文件存在）
+        3. 指定 title 正则
+        4. 自动匹配已登录的“网上股票交易系统5.0”主窗口，或回退到 DEFAULT_EXE_PATH
+        """
+        self._get_left_menus_handle.cache_clear()
+        connect_path = exe_path or self._config.DEFAULT_EXE_PATH or None
+
+        if process is not None:
+            self._app = pywinauto.Application(backend="win32").connect(
+                process=int(process), timeout=10
+            )
+        elif connect_path and os.path.exists(connect_path):
+            self._app = pywinauto.Application(backend="win32").connect(
+                path=connect_path, timeout=10
+            )
+        elif title:
+            self._app = pywinauto.Application(backend="win32").connect(
+                title_re=title, timeout=10
+            )
+        else:
+            # 自动探测已登录的同花顺下单窗口（兼容不同安装目录，如 D:\同花顺\ 或 D:\同花顺软件\同花顺\）
+            connected = False
+            for title_pattern in (
+                f".*{re.escape(self._config.TITLE)}.*",
+                r".*网上股票交易系统.*",
+            ):
+                try:
+                    self._app = pywinauto.Application(backend="win32").connect(
+                        title_re=title_pattern, timeout=5
+                    )
+                    connected = True
+                    break
+                except Exception:
+                    continue
+            if not connected:
+                raise ValueError(
+                    "未找到已登录的同花顺下单窗口（网上股票交易系统5.0）。"
+                    "请先手动启动并登录 xiadan.exe，或显式传入 exe_path 参数。"
+                )
+
         self._close_prompt_windows()
-        self._main = self._app.top_window()
+        self._main = self._resolve_main_window()
         self._init_toolbar()
+
+    def _resolve_main_window(self):
+        """优先定位“网上股票交易系统”主窗口，避免 top_window() 误拿到气泡/弹窗。"""
+        for title_pattern in (
+            f".*{re.escape(self._config.TITLE)}.*",
+            r".*网上股票交易系统.*",
+        ):
+            try:
+                win = self._app.window(title_re=title_pattern)
+                if win.exists(timeout=1):
+                    return win
+            except Exception:
+                continue
+        try:
+            return self._app.top_window()
+        except RuntimeError as ex:
+            if "No windows for that process could be found" in str(ex):
+                is_admin = False
+                try:
+                    import ctypes
+
+                    is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"{ex}。可能原因：(1) xiadan.exe 未登录或最小化在托盘；"
+                    f"(2) Windows UIPI 权限隔离——当前 Python 管理员权限={is_admin}，"
+                    f"若同花顺以管理员身份运行，请以同等权限运行 Python/MCP 客户端，或取消同花顺的管理员权限。"
+                ) from ex
+            raise
 
     @property
     def broker_type(self):
@@ -129,16 +193,59 @@ class ClientTrader(IClientTrader):
         return self._get_balance_from_statics()
 
     def _init_toolbar(self):
-        self._toolbar = self._main.child_window(class_name="ToolbarWindow32")
+        try:
+            self._toolbar = self._main.child_window(class_name="ToolbarWindow32")
+        except Exception as ex:
+            logger.debug("init toolbar ignored: %s", ex)
+            self._toolbar = None
 
-    def _get_balance_from_statics(self):
+    def _ensure_main_window_ready(self):
+        """确保主窗口未处于最小化状态并置于前台（修复 Issue #506 / #457）。"""
+        if self._main is None:
+            return
+        try:
+            if self._main.has_style(win32defines.WS_MINIMIZE):
+                ShowWindow(self._main.wrapper_object(), 9)  # SW_RESTORE
+                self.wait(0.2)
+            SetForegroundWindow(self._main.wrapper_object())
+        except Exception as ex:
+            logger.debug("restore/foreground main window ignored: %s", ex)
+
+    def _get_balance_from_statics(self, max_retry: int = 3):
+        """读取资金股票页面的静态文本字段，处理全 0 或可用金额暂为 0 但总资产非 0 的刷新延迟（修复 Issue #529）。"""
         result = {}
-        for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
-            result[key] = float(
-                self._main.child_window(
-                    control_id=control_id, class_name="Static"
-                ).window_text()
+        for attempt in range(max_retry):
+            result = {}
+            for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
+                try:
+                    ctrl = self._main.child_window(
+                        control_id=control_id, class_name="Static"
+                    )
+                    raw_text = ctrl.window_text().replace(",", "").strip()
+                    if raw_text in ("", "--", "-"):
+                        result[key] = 0.0
+                    else:
+                        result[key] = float(raw_text)
+                except Exception as ex:
+                    logger.warning(
+                        "读取资金字段 %s (control_id=%s) 失败: %s", key, control_id, ex
+                    )
+
+            total_assets = result.get("总资产", 0.0)
+            available = result.get("可用金额", 0.0)
+            balance_val = result.get("资金余额", 0.0)
+            all_zero = all(v == 0.0 for v in result.values())
+            partial_zero_bug = (available == 0.0) and (total_assets > 0.0 or balance_val > 0.0)
+
+            if (not all_zero and not partial_zero_bug) or attempt == max_retry - 1:
+                return result
+            logger.debug(
+                "检测到资金字段可能尚未刷新完成 (result=%s)，等待 0.3s 重试 (%d/%d)...",
+                result,
+                attempt + 1,
+                max_retry,
             )
+            self.wait(0.3)
         return result
 
     @property
@@ -169,8 +276,12 @@ class ClientTrader(IClientTrader):
     @perf_clock
     def cancel_entrust(self, entrust_no):
         self.refresh()
+        target_no = str(entrust_no).strip()
         for i, entrust in enumerate(self.cancel_entrusts):
-            if entrust[self._config.CANCEL_ENTRUST_ENTRUST_FIELD] == entrust_no:
+            field_val = str(
+                entrust.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")
+            ).strip()
+            if field_val == target_no:
                 self._cancel_entrust_by_double_click(i)
                 return self._handle_pop_dialogs()
         return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
@@ -211,16 +322,16 @@ class ClientTrader(IClientTrader):
         return self.trade(security, price, amount)
 
     @perf_clock
-    def buy(self, security, price, amount, **kwargs):
+    def buy(self, security, price, amount, dry_run=False, **kwargs):
         self._switch_left_menus(["买入[F1]"])
 
-        return self.trade(security, price, amount)
+        return self.trade(security, price, amount, dry_run=dry_run)
 
     @perf_clock
-    def sell(self, security, price, amount, **kwargs):
+    def sell(self, security, price, amount, dry_run=False, **kwargs):
         self._switch_left_menus(["卖出[F2]"])
 
-        return self.trade(security, price, amount)
+        return self.trade(security, price, amount, dry_run=dry_run)
 
     @perf_clock
     def market_buy(self, security, amount, ttype=None, limit_price=None, **kwargs):
@@ -303,10 +414,16 @@ class ClientTrader(IClientTrader):
         raise TypeError("不支持对应的市价类型: {}".format(ttype))
 
     def _set_stock_exchange_type(self, ttype):
-        """根据选择的市价交易类型选择对应的下拉选项"""
+        """根据选择的市场类型选择对应的下拉选项（新版同花顺已取消该下拉框，不存在时安全跳过，修复 Issue #514 / #524）。"""
         selects = self._main.child_window(
             control_id=self._config.TRADE_STOCK_EXCHANGE_CONTROL_ID, class_name="ComboBox"
         )
+        if not selects.exists(timeout=0.5):
+            logger.info(
+                "当前同花顺客户端不存在交易所选择下拉框 (control_id=%s)，已自动跳过",
+                self._config.TRADE_STOCK_EXCHANGE_CONTROL_ID,
+            )
+            return
 
         for i, text in enumerate(selects.texts()):
             # skip 0 index, because 0 index is current select index
@@ -397,27 +514,106 @@ class ClientTrader(IClientTrader):
         self._app.kill()
 
     def _close_prompt_windows(self):
-        self.wait(1)
-        for window in self._app.windows(class_name="#32770", visible_only=True):
-            title = window.window_text()
-            if title != self._config.TITLE:
-                logging.info("close window %s" % title)
-                window.close()
-                self.wait(0.2)
-        self.wait(1)
+        self.wait(0.3)
+        self._dismiss_non_trade_popups()
+        self.wait(0.2)
+
+    def _dismiss_non_trade_popups(self):
+        """检测并安全关闭同花顺广告、公告、新股提醒、成交回报等非交易确认弹窗（修复 Issue #376）。"""
+        if self._app is None:
+            return
+        try:
+            windows = self._app.windows(class_name="#32770", visible_only=True)
+        except Exception:
+            return
+        for window in windows:
+            try:
+                title = window.window_text()
+                if pop_dialog_handler.is_non_trade_popup_title(title, self._config.TITLE):
+                    logger.info("安全关闭非交易干扰弹窗: %r", title)
+                    window.close()
+                    self.wait(0.15)
+            except Exception as ex:
+                logger.debug("关闭干扰弹窗忽略异常: %s", ex)
 
     def close_pormpt_window_no_wait(self):
-        for window in self._app.windows(class_name="#32770"):
-            if window.window_text() != self._config.TITLE:
-                window.close()
+        self._dismiss_non_trade_popups()
 
-    def trade(self, security, price, amount):
-        self._set_trade_params(security, price, amount)
+    def _verify_entrust_in_today_entrusts(self, code: str, price_str: str, amount: int):
+        """下单后若未检测到确认弹窗，反查当日委托核实是否实际生成委托单（修复 Issue #457）。"""
+        try:
+            entrusts = self.today_entrusts or []
+            target_price = float(price_str)
+            target_amount = int(amount)
+            # 倒序查找最新一条匹配的委托
+            for row in reversed(entrusts):
+                row_code = str(row.get("证券代码", "")).strip()[-6:]
+                if row_code != code:
+                    continue
+                try:
+                    row_price = float(str(row.get("委托价格", "0")).replace(",", "").strip())
+                    row_amount = int(float(str(row.get("委托数量", "0")).replace(",", "").strip()))
+                except (TypeError, ValueError):
+                    continue
+                if abs(row_price - target_price) < 1e-4 and row_amount == target_amount:
+                    entrust_no = str(
+                        row.get("合同编号") or row.get("委托编号") or ""
+                    ).strip()
+                    if entrust_no:
+                        return {
+                            "entrust_no": entrust_no,
+                            "verified_by": "today_entrusts",
+                            "message": "通过当日委托反查确认委托单已生成",
+                        }
+        except Exception as ex:
+            logger.warning("反查当日委托失败: %s", ex)
+        return None
 
+    def trade(self, security, price, amount, dry_run=False):
+        code = str(security)[-6:]
+        price_str = str(easyutils.round_price_by_code(float(price), code))
+        amount_int = int(amount)
+
+        if dry_run:
+            self._ensure_main_window_ready()
+            self._dismiss_non_trade_popups()
+            submit_exists = self._main.child_window(
+                control_id=self._config.TRADE_SUBMIT_CONTROL_ID, class_name="Button"
+            ).exists(timeout=1)
+            logger.info(
+                "[DRY_RUN] 跳过实际下单点击: code=%s price=%s amount=%s submit_btn_ready=%s",
+                code,
+                price_str,
+                amount_int,
+                submit_exists,
+            )
+            return {
+                "dry_run": True,
+                "security": code,
+                "price": float(price_str),
+                "price_text": price_str,
+                "amount": amount_int,
+                "submit_button_ready": submit_exists,
+                "message": "DRY_RUN 模式已开启：仅完成参数与界面控件校验，未点击确认下单",
+            }
+
+        self._set_trade_params(code, price_str, amount_int)
         self._submit_trade()
 
-        return self._handle_pop_dialogs(
+        result = self._handle_pop_dialogs(
             handler_class=pop_dialog_handler.TradePopDialogHandler
+        )
+        if result and result.get("entrust_no"):
+            return result
+
+        # 若未通过弹窗拿到委托单号（例如客户端关闭了确认弹窗），反查当日委托核实（Issue #457）
+        verified = self._verify_entrust_in_today_entrusts(code, price_str, amount_int)
+        if verified:
+            return verified
+
+        raise exceptions.TradeError(
+            f"下单校验失败：点击下单后未收到委托确认弹窗，且在当日委托中也未查到匹配记录 "
+            f"(code={code}, price={price_str}, amount={amount_int})。请人工核对客户端状态！"
         )
 
     def _click(self, control_id):
@@ -434,7 +630,7 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def __get_top_window_pop_dialog(self):
-        return self._app.top_window().window(
+        return self._app.top_window().child_window(
             control_id=self._config.POP_DIALOD_TITLE_CONTROL_ID
         )
 
@@ -446,29 +642,121 @@ class ClientTrader(IClientTrader):
             .window_text()
         )
 
-    def _set_trade_params(self, security, price, amount):
-        code = security[-6:]
+    def _set_and_verify_edit(
+        self, control_id: int, expected_text: str, field_name: str, is_float: bool = False
+    ):
+        """写入输入框并回读校验文本完全一致；若受输入法或行情回填干扰则自动采用剪贴板粘贴重试（修复 Issue #457 / #522）。"""
+        editor = self._main.child_window(control_id=control_id, class_name="Edit")
+        expected_str = str(expected_text).strip()
 
-        self._type_edit_control_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
+        def _matches(actual: str) -> bool:
+            a = (actual or "").strip()
+            if a == expected_str:
+                return True
+            if is_float:
+                try:
+                    # 确保小数点完整且数值一致（兼容 ETF 3 位小数，如 2.259）
+                    return abs(float(a) - float(expected_str)) < 1e-6 and (
+                        "." in a if "." in expected_str else True
+                    )
+                except ValueError:
+                    return False
+            return False
 
-        # wait security input finish
+        # 第 1 次尝试：标准方式写入
+        self.type_edit_control_keys(editor, expected_str)
+        self.wait(0.08)
+        actual = editor.window_text().strip()
+        if _matches(actual):
+            return
+
+        # 第 2 次尝试：使用剪贴板粘贴（^a^v），彻底免疫中文输入法与小数点吞字问题
+        logger.warning(
+            "%s 输入框回读不一致 (actual=%r, expected=%r)，切换剪贴板粘贴重试...",
+            field_name,
+            actual,
+            expected_str,
+        )
+        self._paste_into_edit(editor, expected_str)
         self.wait(0.1)
+        actual = editor.window_text().strip()
+        if not _matches(actual):
+            raise exceptions.TradeError(
+                f"{field_name} 输入框校验失败：期望 {expected_str!r}，实际控件文本为 {actual!r}，已中止下单！"
+            )
 
-        # 设置交易所
-        # if security.lower().startswith("sz"):
-        #     self._set_stock_exchange_type("深圳Ａ股")
-        # if security.lower().startswith("sh"):
-        #     self._set_stock_exchange_type("上海Ａ股")
-        #
-        # self.wait(0.1)
+    def _paste_into_edit(self, editor, text: str):
+        """通过剪贴板全选粘贴写入输入框，避免中文输入法拦截小数点或数字。"""
+        try:
+            import pyperclip
 
-        self._type_edit_control_keys(
-            self._config.TRADE_PRICE_CONTROL_ID,
-            easyutils.round_price_by_code(price, code),
+            pyperclip.copy(str(text))
+            editor.set_focus()
+            editor.type_keys("^a^v", set_foreground=False)
+        except Exception as ex:
+            logger.debug("剪贴板粘贴回退到 set_edit_text: %s", ex)
+            editor.set_edit_text(str(text))
+
+    def _set_trade_params(self, security, price, amount):
+        self._ensure_main_window_ready()
+        self._dismiss_non_trade_popups()
+        code = str(security)[-6:]
+        price_str = str(easyutils.round_price_by_code(float(price), code))
+        amount_str = str(int(amount))
+
+        # 1. 写入并校验证券代码
+        self._set_and_verify_edit(
+            self._config.TRADE_SECURITY_CONTROL_ID, code, "证券代码", is_float=False
         )
-        self._type_edit_control_keys(
-            self._config.TRADE_AMOUNT_CONTROL_ID, str(int(amount))
+
+        # 等待同花顺回填股票名称与最新行情价，避免后续覆写手动输入的价格（修复 Issue #522）
+        self.wait(0.3)
+
+        # 2. 写入并校验委托价格（兼容 ETF 3 位小数，如 2.259）
+        self._set_and_verify_edit(
+            self._config.TRADE_PRICE_CONTROL_ID, price_str, "委托价格", is_float=True
         )
+
+        # 3. 写入并校验委托数量
+        self._set_and_verify_edit(
+            self._config.TRADE_AMOUNT_CONTROL_ID, amount_str, "委托数量", is_float=False
+        )
+
+        # 4. 点击下单前最终全量回读三项输入框，防止行情延迟回填篡改价格（修复 Issue #457 / #522）
+        final_code = (
+            self._main.child_window(
+                control_id=self._config.TRADE_SECURITY_CONTROL_ID, class_name="Edit"
+            )
+            .window_text()
+            .strip()
+        )
+        final_price = (
+            self._main.child_window(
+                control_id=self._config.TRADE_PRICE_CONTROL_ID, class_name="Edit"
+            )
+            .window_text()
+            .strip()
+        )
+        final_amount = (
+            self._main.child_window(
+                control_id=self._config.TRADE_AMOUNT_CONTROL_ID, class_name="Edit"
+            )
+            .window_text()
+            .strip()
+        )
+        if final_code != code or final_amount != amount_str:
+            raise exceptions.TradeError(
+                f"下单前最终核对失败：code={final_code!r}(期望{code!r}), "
+                f"amount={final_amount!r}(期望{amount_str!r})，已中止下单！"
+            )
+        try:
+            if abs(float(final_price) - float(price_str)) >= 1e-6:
+                raise ValueError("price mismatch")
+        except ValueError:
+            # 若价格在输入数量瞬间被行情覆写，最后再纠正一次并复核
+            self._set_and_verify_edit(
+                self._config.TRADE_PRICE_CONTROL_ID, price_str, "委托价格", is_float=True
+            )
 
     def _set_market_trade_params(self, security, amount, limit_price=None):
         self._type_edit_control_keys(
@@ -495,21 +783,18 @@ class ClientTrader(IClientTrader):
         )
 
     def _type_edit_control_keys(self, control_id, text):
-        if not self._editor_need_type_keys:
-            self._main.child_window(
-                control_id=control_id, class_name="Edit"
-            ).set_edit_text(text)
-        else:
-            editor = self._main.child_window(control_id=control_id, class_name="Edit")
-            editor.select()
-            editor.type_keys(text)
+        editor = self._main.child_window(control_id=control_id, class_name="Edit")
+        self.type_edit_control_keys(editor, str(text))
 
     def type_edit_control_keys(self, editor, text):
+        text_str = str(text)
         if not self._editor_need_type_keys:
-            editor.set_edit_text(text)
+            editor.set_edit_text(text_str)
         else:
-            editor.select()
-            editor.type_keys(text)
+            editor.set_focus()
+            editor.type_keys("^a{BACKSPACE}", set_foreground=False)
+            self.wait(0.05)
+            editor.type_keys(text_str, set_foreground=False)
 
     def _collapse_left_menus(self):
         items = self._get_left_menus_handle().roots()
@@ -518,9 +803,31 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def _switch_left_menus(self, path, sleep=0.2):
+        self._ensure_main_window_ready()
+        self.close_pormpt_window_no_wait()
         self.close_pop_dialog()
-        self._get_left_menus_handle().get_item(path).select()
-        self._app.top_window().type_keys('{F5}')
+        try:
+            self._get_left_menus_handle().get_item(path).select()
+        except Exception as ex:
+            # 容错：部分新版同花顺菜单名称略有差异，优先尝试常见快捷键回退
+            shortcut_map = {
+                ("买入[F1]",): "{F1}",
+                ("卖出[F2]",): "{F2}",
+                ("撤单[F3]",): "{F3}",
+                ("查询[F4]", "资金股票"): "{F4}",
+            }
+            shortcut = shortcut_map.get(tuple(path))
+            if shortcut:
+                logger.warning(
+                    "左侧菜单树定位 %s 失败 (%s)，回退使用快捷键 %s", path, ex, shortcut
+                )
+                self._main.type_keys(shortcut)
+            else:
+                raise
+        try:
+            self._main.type_keys("{F5}")
+        except Exception:
+            self._app.top_window().type_keys("{F5}")
         self.wait(sleep)
 
     def _switch_left_menus_by_shortcut(self, shortcut, sleep=0.5):
@@ -564,8 +871,10 @@ class ClientTrader(IClientTrader):
     @perf_clock
     def _handle_pop_dialogs(self, handler_class=pop_dialog_handler.PopDialogHandler):
         handler = handler_class(self._app)
+        handled_any = False
 
         while self.is_exist_pop_dialog():
+            handled_any = True
             try:
                 title = self._get_pop_dialog_title()
             except pywinauto.findwindows.ElementNotFoundError:
@@ -574,6 +883,15 @@ class ClientTrader(IClientTrader):
             result = handler.handle(title)
             if result:
                 return result
+
+        if not handled_any and handler_class is pop_dialog_handler.TradePopDialogHandler:
+            logger.warning(
+                "未检测到委托确认或成交结果弹窗（Issue #457），请核对当日委托并检查客户端设置"
+            )
+            return {
+                "message": "no_popup_detected",
+                "warning": "未检测到委托确认或结果弹窗，无法确认是否已下单，请通过当日委托核实并检查同花顺下单确认弹窗设置",
+            }
         return {"message": "success"}
 
 
