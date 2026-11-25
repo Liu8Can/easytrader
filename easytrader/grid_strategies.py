@@ -81,81 +81,30 @@ class BaseStrategy(IGridStrategy):
 
     def _handle_captcha_dialog(self, max_retry: int = 5) -> bool:
         """
-        检测并尝试自动处理同花顺复制/导出表格时弹出的验证码弹窗。
-        返回 True 表示无验证码弹窗或验证码已通过；若识别失败则关闭弹窗并抛出 TradeError。
+        检测同花顺复制/导出表格时弹出的风控验证码弹窗（如“检测到你正在拷贝数据 请输入验证码”）。
+        遇到验证码时绝不死循环卡死或静默返回空列表，直接明确抛出需要人工输入验证码的提示。
         """
-        top = self._trader.app.top_window()
         try:
-            has_captcha = top.child_window(
-                class_name="Static", title_re=".*验证码.*"
-            ).exists(timeout=0.6)
-        except Exception:
-            has_captcha = False
-
-        if not has_captcha:
-            return True
-
-        logger.warning("检测到同花顺验证码弹窗，尝试自动识别...")
-        fd, file_path = tempfile.mkstemp(suffix=".png", prefix="easytrader_captcha_")
-        os.close(fd)
-        found = False
-        last_err = None
-        try:
-            count = max_retry
-            while count > 0:
-                top = self._trader.app.top_window()
-                captcha_ctrl = top.child_window(control_id=0x965, class_name="Static")
-                if not captcha_ctrl.exists(timeout=0.5):
-                    found = True
-                    break
-
-                captcha_ctrl.capture_as_image().save(file_path)
-                try:
-                    captcha_num = captcha_recognize(file_path).strip()
-                except Exception as ex:
-                    last_err = ex
-                    logger.error("验证码 OCR 识别异常（可能未安装 tesseract）: %s", ex)
-                    break
-
-                captcha_num = "".join(captcha_num.split())
-                logger.info("captcha result-->%s", captcha_num)
-                if len(captcha_num) == 4:
-                    editor = top.child_window(control_id=0x964, class_name="Edit")
-                    editor.set_focus()
-                    self._trader.wait(0.1)
-                    self._trader.type_edit_control_keys(editor, captcha_num)
-                    self._trader.wait(0.1)
-                    top.type_keys("{ENTER}", pause=0.1)
-                    if not editor.exists(timeout=1):
-                        logger.info("验证码验证成功-->%s", captcha_num)
-                        found = True
-                        break
-                count -= 1
-                self._trader.wait(0.1)
-                try:
-                    captcha_ctrl.click()
-                except Exception:
-                    pass
-
-            if not found:
-                try:
-                    self._trader.app.top_window().Button2.click()
-                except Exception:
-                    try:
-                        self._trader.app.top_window().close()
-                    except Exception:
-                        pass
-                detail = f" ({last_err})" if last_err else ""
+            top = self._trader.app.top_window()
+            # 如果 top_window 就是主窗口本身，说明没有弹窗
+            if top.handle == self._trader.main.handle:
+                return True
+            static_texts = [
+                c.window_text().strip()
+                for c in top.descendants(class_name="Static")
+                if c.window_text().strip()
+            ]
+            combined = " ".join(static_texts)
+            if "验证码" in combined or "拷贝数据" in combined:
+                logger.warning("检测到同花顺风控验证码弹窗: %s", combined)
                 raise exceptions.TradeError(
-                    f"同花顺弹出验证码，需要人工输入验证码后重试{detail}（建议减少高频刷新或在客户端手动完成验证）"
+                    f"同花顺弹出风控验证码（{combined}），需要人工在客户端输入验证码后重试"
                 )
-            return True
-        finally:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
+        except exceptions.TradeError:
+            raise
+        except Exception as ex:
+            logger.debug("check captcha dialog ignored: %s", ex)
+        return True
 
     def _parse_tsv_content(self, content: str) -> List[Dict]:
         if not content or not content.strip():

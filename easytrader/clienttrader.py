@@ -219,6 +219,31 @@ class ClientTrader(IClientTrader):
         except Exception as ex:
             logger.debug("restore/foreground main window ignored: %s", ex)
 
+    def _find_visible_child(self, control_id: int, class_name: str, timeout: float = 1.5):
+        """
+        绕过 pywinauto .exists() 内部强行将 visible_only 设为 False 的坑，
+        通过 descendants() + is_visible() 精准定位当前激活面板中的唯一可见控件。
+        """
+        deadline = time.time() + timeout
+        while True:
+            try:
+                matches = [
+                    ctrl
+                    for ctrl in self._main.descendants(
+                        control_id=control_id, class_name=class_name
+                    )
+                    if ctrl.is_visible()
+                ]
+                if matches:
+                    return matches[0]
+            except Exception as ex:
+                logger.debug(
+                    "find visible child (%s, %s) retry: %s", control_id, class_name, ex
+                )
+            if time.time() >= deadline:
+                return None
+            self.wait(0.1)
+
     def _get_balance_from_statics(self, max_retry: int = 3):
         """读取资金股票页面的静态文本字段，处理全 0 或可用金额暂为 0 但总资产非 0 的刷新延迟（修复 Issue #529）。"""
         result = {}
@@ -226,9 +251,9 @@ class ClientTrader(IClientTrader):
             result = {}
             for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
                 try:
-                    ctrl = self._main.child_window(
-                        control_id=control_id, class_name="Static", visible_only=True
-                    )
+                    ctrl = self._find_visible_child(control_id, "Static", timeout=1.0)
+                    if ctrl is None:
+                        continue
                     raw_text = ctrl.window_text().replace(",", "").strip()
                     if raw_text in ("", "--", "-"):
                         result[key] = 0.0
@@ -585,27 +610,23 @@ class ClientTrader(IClientTrader):
         if dry_run:
             self._ensure_main_window_ready()
             self._dismiss_non_trade_popups()
-            # 必须加 visible_only=True：同花顺切换标签页后旧面板仍隐藏驻留内存，含多个相同 control_id
-            submit_exists = self._main.child_window(
-                control_id=self._config.TRADE_SUBMIT_CONTROL_ID,
-                class_name="Button",
-                visible_only=True,
-            ).exists(timeout=1)
-            code_exists = self._main.child_window(
-                control_id=self._config.TRADE_SECURITY_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            ).exists(timeout=1)
-            price_exists = self._main.child_window(
-                control_id=self._config.TRADE_PRICE_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            ).exists(timeout=1)
-            amount_exists = self._main.child_window(
-                control_id=self._config.TRADE_AMOUNT_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            ).exists(timeout=1)
+            # 通过 descendants()+is_visible() 精准检查当前激活面板，避开 pywinauto .exists() 强设 visible_only=False 的坑
+            submit_ctrl = self._find_visible_child(
+                self._config.TRADE_SUBMIT_CONTROL_ID, "Button", timeout=1.5
+            )
+            code_ctrl = self._find_visible_child(
+                self._config.TRADE_SECURITY_CONTROL_ID, "Edit", timeout=1.0
+            )
+            price_ctrl = self._find_visible_child(
+                self._config.TRADE_PRICE_CONTROL_ID, "Edit", timeout=1.0
+            )
+            amount_ctrl = self._find_visible_child(
+                self._config.TRADE_AMOUNT_CONTROL_ID, "Edit", timeout=1.0
+            )
+            submit_exists = submit_ctrl is not None
+            code_exists = code_ctrl is not None
+            price_exists = price_ctrl is not None
+            amount_exists = amount_ctrl is not None
             logger.info(
                 "[DRY_RUN] 跳过实际下单点击: code=%s price=%s amount=%s controls_ready=(submit=%s,code=%s,price=%s,amount=%s)",
                 code,
@@ -623,6 +644,7 @@ class ClientTrader(IClientTrader):
                 "price_text": price_str,
                 "amount": amount_int,
                 "submit_button_ready": submit_exists,
+                "submit_button_text": submit_ctrl.window_text() if submit_ctrl else "",
                 "edit_controls_ready": {
                     "code": code_exists,
                     "price": price_exists,
@@ -658,11 +680,12 @@ class ClientTrader(IClientTrader):
     @perf_clock
     def _submit_trade(self):
         time.sleep(0.2)
-        self._main.child_window(
-            control_id=self._config.TRADE_SUBMIT_CONTROL_ID,
-            class_name="Button",
-            visible_only=True,
-        ).click()
+        btn = self._find_visible_child(
+            self._config.TRADE_SUBMIT_CONTROL_ID, "Button", timeout=2.0
+        )
+        if btn is None:
+            raise exceptions.TradeError("未找到当前可见的下单确认按钮")
+        btn.click()
 
     @perf_clock
     def __get_top_window_pop_dialog(self):
@@ -682,9 +705,11 @@ class ClientTrader(IClientTrader):
         self, control_id: int, expected_text: str, field_name: str, is_float: bool = False
     ):
         """写入输入框并回读校验文本完全一致；若受输入法或行情回填干扰则自动采用剪贴板粘贴重试（修复 Issue #457 / #522）。"""
-        editor = self._main.child_window(
-            control_id=control_id, class_name="Edit", visible_only=True
-        )
+        editor = self._find_visible_child(control_id, "Edit", timeout=2.0)
+        if editor is None:
+            raise exceptions.TradeError(
+                f"未找到可见的 {field_name} 输入框 (control_id={control_id})"
+            )
         expected_str = str(expected_text).strip()
 
         def _matches(actual: str) -> bool:
@@ -761,33 +786,12 @@ class ClientTrader(IClientTrader):
         )
 
         # 4. 点击下单前最终全量回读三项输入框，防止行情延迟回填篡改价格（修复 Issue #457 / #522）
-        final_code = (
-            self._main.child_window(
-                control_id=self._config.TRADE_SECURITY_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            )
-            .window_text()
-            .strip()
-        )
-        final_price = (
-            self._main.child_window(
-                control_id=self._config.TRADE_PRICE_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            )
-            .window_text()
-            .strip()
-        )
-        final_amount = (
-            self._main.child_window(
-                control_id=self._config.TRADE_AMOUNT_CONTROL_ID,
-                class_name="Edit",
-                visible_only=True,
-            )
-            .window_text()
-            .strip()
-        )
+        code_ed = self._find_visible_child(self._config.TRADE_SECURITY_CONTROL_ID, "Edit")
+        price_ed = self._find_visible_child(self._config.TRADE_PRICE_CONTROL_ID, "Edit")
+        amount_ed = self._find_visible_child(self._config.TRADE_AMOUNT_CONTROL_ID, "Edit")
+        final_code = code_ed.window_text().strip() if code_ed else ""
+        final_price = price_ed.window_text().strip() if price_ed else ""
+        final_amount = amount_ed.window_text().strip() if amount_ed else ""
         if final_code != code or final_amount != amount_str:
             raise exceptions.TradeError(
                 f"下单前最终核对失败：code={final_code!r}(期望{code!r}), "

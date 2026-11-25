@@ -10,13 +10,13 @@ import json
 import os
 import sys
 
-# 强制开启安全演练模式 + 无感后台模式（不抢前台焦点）
+# 强制开启安全演练模式（默认使用实测无验证码的 copy 策略）
 os.environ["DRY_RUN"] = "true"
 os.environ.setdefault("MAX_ORDER_AMOUNT", "10000")
 os.environ.setdefault("EASYTRADER_EXE_PATH", r"D:\同花顺软件\同花顺\xiadan.exe")
 os.environ.setdefault("EASYTRADER_BROKER", "ths")
-os.environ.setdefault("EASYTRADER_BACKGROUND_MODE", "true")
-os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "wmcopy")
+os.environ.setdefault("EASYTRADER_BACKGROUND_MODE", "false")
+os.environ.setdefault("EASYTRADER_GRID_STRATEGY", "copy")
 
 import mcp_server
 
